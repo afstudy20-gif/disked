@@ -250,17 +250,17 @@ async function scanDirectoryRecursive(dirPath, state) {
   try {
     const entries = await fsLimiter.run(() => fs.readdir(dirPath, { withFileTypes: true }));
 
-    for (const entry of entries) {
-      if (state.cancelled) return 0;
+    const promises = entries.map(async (entry) => {
+      if (state.cancelled) return null;
       const fullPath = path.join(dirPath, entry.name);
 
       // Check exclusions dynamically
       if (isExcluded(fullPath, home, state.targetPath)) {
-        continue;
+        return null;
       }
 
       if (entry.isSymbolicLink()) {
-        continue;
+        return null;
       }
 
       if (entry.isDirectory()) {
@@ -280,19 +280,18 @@ async function scanDirectoryRecursive(dirPath, state) {
           mtime = stats.mtime;
         } catch (e) {}
 
-        totalSize += subSize;
-        children.push({
+        return {
           name: entry.name,
           path: fullPath,
           isDirectory: true,
           size: subSize,
           updatedAt: mtime
-        });
+        };
       } else if (entry.isFile()) {
         try {
           const stats = await fsLimiter.run(() => fs.lstat(fullPath));
           const size = stats.blocks !== undefined ? Math.min(stats.size, stats.blocks * 512) : stats.size;
-          totalSize += size;
+          
           state.filesScanned++;
           state.totalSizeCalculated += size;
 
@@ -304,16 +303,27 @@ async function scanDirectoryRecursive(dirPath, state) {
           });
 
           // Add file to folder's children list
-          children.push({
+          return {
             name: entry.name,
             path: fullPath,
             isDirectory: false,
             size: size,
             updatedAt: stats.mtime
-          });
+          };
         } catch (e) {
           // File might be missing or locked
+          return null;
         }
+      }
+      return null;
+    });
+
+    const results = await Promise.all(promises);
+
+    for (const res of results) {
+      if (res) {
+        totalSize += res.size;
+        children.push(res);
       }
     }
   } catch (err) {
@@ -339,23 +349,33 @@ async function getFolderSizeFast(dirPath, state) {
   let size = 0;
   try {
     const entries = await fsLimiter.run(() => fs.readdir(dirPath, { withFileTypes: true }));
-    for (const entry of entries) {
+    
+    const promises = entries.map(async (entry) => {
       if (state.cancelled) return 0;
       const fullPath = path.join(dirPath, entry.name);
       
-      if (entry.isSymbolicLink()) continue;
+      if (entry.isSymbolicLink()) return 0;
 
       if (entry.isDirectory()) {
-        size += await getFolderSizeFast(fullPath, state);
+        return await getFolderSizeFast(fullPath, state);
       } else if (entry.isFile()) {
         try {
           const stats = await fsLimiter.run(() => fs.lstat(fullPath));
           const physicalSize = stats.blocks !== undefined ? Math.min(stats.size, stats.blocks * 512) : stats.size;
-          size += physicalSize;
+          
           state.filesScanned++;
           state.totalSizeCalculated += physicalSize;
-        } catch (e) {}
+          return physicalSize;
+        } catch (e) {
+          return 0;
+        }
       }
+      return 0;
+    });
+
+    const sizes = await Promise.all(promises);
+    for (const s of sizes) {
+      size += s;
     }
   } catch (e) {}
   return size;
