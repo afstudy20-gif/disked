@@ -169,7 +169,7 @@ const LEAF_DIRECTORIES = new Set([
 ]);
 
 // Helper to determine if a directory should be skipped from scanning
-function isExcluded(fullPath, homeDir) {
+function isExcluded(fullPath, homeDir, targetPath) {
   const normalized = path.normalize(fullPath);
   const name = path.basename(normalized);
 
@@ -179,6 +179,13 @@ function isExcluded(fullPath, homeDir) {
     '.Trash'
   ];
   if (excludedNames.includes(name)) return true;
+
+  // Prevent scanning the mounted host root /host when starting the scan from container paths
+  if (targetPath && !targetPath.startsWith('/host')) {
+    if (normalized === '/host' || normalized.startsWith('/host' + path.sep)) {
+      return true;
+    }
+  }
 
   const systemPaths = [
     '/System',
@@ -248,7 +255,7 @@ async function scanDirectoryRecursive(dirPath, state) {
       const fullPath = path.join(dirPath, entry.name);
 
       // Check exclusions dynamically
-      if (isExcluded(fullPath, home)) {
+      if (isExcluded(fullPath, home, state.targetPath)) {
         continue;
       }
 
@@ -407,6 +414,7 @@ app.post('/api/scan', async (req, res) => {
     active: true,
     cancelled: false,
     currentPath: targetPath,
+    targetPath: targetPath,
     foldersScanned: 0,
     filesScanned: 0,
     totalSizeCalculated: 0,
