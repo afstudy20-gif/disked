@@ -30,6 +30,33 @@ app.use((req, res, next) => {
   next();
 });
 
+// Optional Basic Auth Middleware based on Environment Variables
+const authUser = process.env.BASIC_AUTH_USER;
+const authPass = process.env.BASIC_AUTH_PASS;
+if (authUser && authPass) {
+  app.use((req, res, next) => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) {
+      res.setHeader('WWW-Authenticate', 'Basic realm="Secure Disk Analyzer"');
+      return res.status(401).send('Authentication required');
+    }
+
+    try {
+      const token = authHeader.split(' ')[1];
+      const credentials = Buffer.from(token, 'base64').toString('utf8').split(':');
+      const user = credentials[0];
+      const pass = credentials[1];
+
+      if (user === authUser && pass === authPass) {
+        return next();
+      }
+    } catch (e) {}
+
+    res.setHeader('WWW-Authenticate', 'Basic realm="Secure Disk Analyzer"');
+    return res.status(401).send('Authentication required');
+  });
+}
+
 // Global scanner state
 let scanState = {
   active: false,
