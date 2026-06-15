@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { apiInvoke } from '../utils/api';
+import { apiInvoke, isTauri } from '../utils/api';
 
 export default function TerminalConsole() {
+  const isWindowsDesktop = isTauri() && navigator.userAgent.toLowerCase().includes('win');
   const [cwd, setCwd] = useState('~');
   const [input, setInput] = useState('');
   const [history, setHistory] = useState([
@@ -105,36 +106,62 @@ export default function TerminalConsole() {
       {/* Quick shortcuts header */}
       <div className="terminal-shortcuts" style={{ gap: '0.5rem' }}>
         <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', fontWeight: 'bold' }}>Quick Commands:</span>
-        <button className="btn" onClick={() => runQuickCommand('df -h')} disabled={executing} title="Disk space usage">
-          💾 Disk Space (df -h)
-        </button>
-        <button className="btn" onClick={() => runQuickCommand('du -sh *')} disabled={executing} title="Folder sizes in current dir">
-          📂 Folder Sizes (du -sh *)
-        </button>
-        <button className="btn" onClick={() => runQuickCommand('diskutil list')} disabled={executing} title="List all disks and partitions">
-          💿 List Disks (diskutil list)
-        </button>
-        <button className="btn" onClick={() => runQuickCommand('tmutil listlocalsnapshots /')} disabled={executing} title="List local Time Machine snapshots">
-          📸 List Snapshots
-        </button>
-        <button className="btn" onClick={() => runQuickCommand('tmutil thinlocalsnapshots / 10000000000 4')} disabled={executing} title="Thin local snapshots to free space">
-          🧹 Clean Snapshots
-        </button>
-        <button className="btn" onClick={() => runQuickCommand('ls -la')} disabled={executing} title="List files in current directory">
-          📋 List Files (ls -la)
-        </button>
-        <button className="btn" onClick={() => runQuickCommand('du -shx /host/* 2>/dev/null')} disabled={executing} title="Safe VPS folder sizes (skips virtual FS)">
-          📂 VPS Sizes (Safe)
-        </button>
-        <button className="btn" onClick={() => runQuickCommand('docker image prune -af')} disabled={executing} title="Prune all unused (dangling and unreferenced) images">
-          🖼️ Docker Image Prune
-        </button>
-        <button className="btn" onClick={() => runQuickCommand('docker builder prune -af')} disabled={executing} title="Clean up legacy docker build cache">
-          🧹 Docker Builder Prune
-        </button>
-        <button className="btn" onClick={() => runQuickCommand('docker system prune -af')} disabled={executing} title="Prune all stopped containers and unused images">
-          🐳 Docker System Prune
-        </button>
+        {isWindowsDesktop ? (
+          <>
+            <button className="btn" onClick={() => runQuickCommand('wmic logicaldisk get caption,size,freespace')} disabled={executing} title="Disk space usage on Windows">
+              💾 Disk Space (wmic)
+            </button>
+            <button className="btn" onClick={() => runQuickCommand('dir')} disabled={executing} title="List files in current directory">
+              📋 List Files (dir)
+            </button>
+            <button className="btn" onClick={() => runQuickCommand('systeminfo')} disabled={executing} title="System information">
+              💻 System Info
+            </button>
+            <button className="btn" onClick={() => runQuickCommand('ipconfig')} disabled={executing} title="IP configuration">
+              🌐 Network Info (ipconfig)
+            </button>
+            <button className="btn" onClick={() => runQuickCommand('tasklist')} disabled={executing} title="List active tasks/processes">
+              ⚙️ Task List (tasklist)
+            </button>
+          </>
+        ) : (
+          <>
+            <button className="btn" onClick={() => runQuickCommand('df -h')} disabled={executing} title="Disk space usage">
+              💾 Disk Space (df -h)
+            </button>
+            <button className="btn" onClick={() => runQuickCommand('du -sh *')} disabled={executing} title="Folder sizes in current dir">
+              📂 Folder Sizes (du -sh *)
+            </button>
+            <button className="btn" onClick={() => runQuickCommand('diskutil list')} disabled={executing} title="List all disks and partitions">
+              💿 List Disks (diskutil list)
+            </button>
+            <button className="btn" onClick={() => runQuickCommand('tmutil listlocalsnapshots /')} disabled={executing} title="List local Time Machine snapshots">
+              📸 List Snapshots
+            </button>
+            <button className="btn" onClick={() => runQuickCommand('tmutil thinlocalsnapshots / 10000000000 4')} disabled={executing} title="Thin local snapshots to free space">
+              🧹 Clean Snapshots
+            </button>
+            <button className="btn" onClick={() => runQuickCommand('ls -la')} disabled={executing} title="List files in current directory">
+              📋 List Files (ls -la)
+            </button>
+            {!isTauri() && (
+              <>
+                <button className="btn" onClick={() => runQuickCommand('du -shx /host/* 2>/dev/null')} disabled={executing} title="Safe VPS folder sizes (skips virtual FS)">
+                  📂 VPS Sizes (Safe)
+                </button>
+                <button className="btn" onClick={() => runQuickCommand('docker image prune -af')} disabled={executing} title="Prune all unused (dangling and unreferenced) images">
+                  🖼️ Docker Image Prune
+                </button>
+                <button className="btn" onClick={() => runQuickCommand('docker builder prune -af')} disabled={executing} title="Clean up legacy docker build cache">
+                  🧹 Docker Builder Prune
+                </button>
+                <button className="btn" onClick={() => runQuickCommand('docker system prune -af')} disabled={executing} title="Prune all stopped containers and unused images">
+                  🐳 Docker System Prune
+                </button>
+              </>
+            )}
+          </>
+        )}
         <button className="btn btn-danger" style={{ marginLeft: 'auto', padding: '0.3rem 0.6rem', fontSize: '0.82rem' }} onClick={clearConsole}>
           Clear
         </button>
