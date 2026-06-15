@@ -10,7 +10,8 @@
     "client": "vite --force",
     "build": "vite build",
     "preview": "vite preview",
-    "dev": "concurrently \"npm run server\" \"npm run client\""
+    "dev": "concurrently \"npm run server\" \"npm run client\"",
+    "tauri": "tauri"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.0",
