@@ -90,6 +90,12 @@ function isSafeToDelete(targetPath) {
   const resolvedHome = path.resolve(home);
   const resolvedTarget = path.resolve(normalized);
 
+  // Strip /host prefix if present to check system protections
+  let checkTarget = resolvedTarget;
+  if (resolvedTarget.startsWith('/host/') || resolvedTarget === '/host') {
+    checkTarget = resolvedTarget === '/host' ? '/' : resolvedTarget.substring(5);
+  }
+
   // Absolute blocked directories
   const blockedPaths = [
     '/',
@@ -103,12 +109,17 @@ function isSafeToDelete(targetPath) {
     '/private',
     '/cores',
     '/dev',
+    '/proc',
+    '/sys',
+    '/run',
+    '/boot',
     '/opt',
     '/Applications',
-    '/Users'
+    '/Users',
+    '/lost+found'
   ];
 
-  if (blockedPaths.includes(resolvedTarget)) {
+  if (blockedPaths.includes(checkTarget)) {
     return false;
   }
 
@@ -128,6 +139,16 @@ function isSafeToDelete(targetPath) {
 
   // Allow deleting items inside the home directory
   if (resolvedTarget.startsWith(resolvedHome + path.sep) || resolvedTarget === path.join(resolvedHome, '.npm') || resolvedTarget === path.join(resolvedHome, '.cargo')) {
+    return true;
+  }
+
+  // If we're inside `/host`, allow deleting if it's not a blocked path and is inside `/host`
+  if (resolvedTarget.startsWith('/host' + path.sep)) {
+    const parts = checkTarget.split(path.sep).filter(Boolean);
+    // If it has fewer than 2 segments (like /etc, /var, /usr), block it.
+    if (parts.length <= 1) {
+      return false;
+    }
     return true;
   }
 
@@ -163,15 +184,34 @@ function isExcluded(fullPath, homeDir) {
     '/System',
     '/Volumes',
     '/dev',
+    '/proc',
+    '/sys',
+    '/run',
+    '/mnt',
+    '/media',
+    '/boot',
     '/cores',
     '/private',
     '/Network',
     '/usr',
     '/bin',
-    '/sbin'
+    '/sbin',
+    '/var/lib/docker',
+    '/var/run/docker.sock',
+    '/lost+found'
   ];
-  if (systemPaths.some(p => normalized === p || normalized.startsWith(p + path.sep))) {
-    return true;
+
+  // Check both the normalized path, and the path with /host prefix stripped if present
+  const checkPaths = [normalized];
+  if (normalized.startsWith('/host/') || normalized === '/host') {
+    const stripped = normalized === '/host' ? '/' : normalized.substring(5);
+    checkPaths.push(stripped);
+  }
+
+  for (const checkPath of checkPaths) {
+    if (systemPaths.some(p => checkPath === p || checkPath.startsWith(p + path.sep))) {
+      return true;
+    }
   }
 
   if (homeDir) {
