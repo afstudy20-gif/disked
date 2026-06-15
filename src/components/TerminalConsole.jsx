@@ -123,6 +123,18 @@ export default function TerminalConsole() {
         <button className="btn" onClick={() => runQuickCommand('ls -la')} disabled={executing} title="List files in current directory">
           📋 List Files (ls -la)
         </button>
+        <button className="btn" onClick={() => runQuickCommand('du -shx /host/* 2>/dev/null')} disabled={executing} title="Safe VPS folder sizes (skips virtual FS)">
+          📂 VPS Sizes (Safe)
+        </button>
+        <button className="btn" onClick={() => runQuickCommand('docker image prune -af')} disabled={executing} title="Prune all unused (dangling and unreferenced) images">
+          🖼️ Docker Image Prune
+        </button>
+        <button className="btn" onClick={() => runQuickCommand('docker builder prune -af')} disabled={executing} title="Clean up legacy docker build cache">
+          🧹 Docker Builder Prune
+        </button>
+        <button className="btn" onClick={() => runQuickCommand('docker system prune -af')} disabled={executing} title="Prune all stopped containers and unused images">
+          🐳 Docker System Prune
+        </button>
         <button className="btn btn-danger" style={{ marginLeft: 'auto', padding: '0.3rem 0.6rem', fontSize: '0.82rem' }} onClick={clearConsole}>
           Clear
         </button>
