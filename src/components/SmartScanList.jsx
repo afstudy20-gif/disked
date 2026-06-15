@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { apiInvoke } from '../utils/api';
 import { formatBytes } from './DiskGauge';
 
 // Safety guidelines gathered from official documentation and developer consensus
@@ -56,7 +56,7 @@ export default function SmartScanList({ selectedPaths, togglePathSelection, onRe
     setLoading(true);
     setError(null);
     try {
-      const data = await invoke('get_smart_scan_targets');
+      const data = await apiInvoke('get_smart_scan_targets');
       setTargets(data);
     } catch (err) {
       setError(err.message || String(err));

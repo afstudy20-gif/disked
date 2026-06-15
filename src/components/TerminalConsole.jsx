@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { apiInvoke } from '../utils/api';
 
 export default function TerminalConsole() {
   const [cwd, setCwd] = useState('~');
@@ -33,7 +33,7 @@ export default function TerminalConsole() {
     setHistory(newHistory);
 
     try {
-      const data = await invoke('run_terminal_command', {
+      const data = await apiInvoke('run_terminal_command', {
         command: cmdText,
         cwd: cwd === '~' ? null : cwd
       });

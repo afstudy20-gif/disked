@@ -1,6 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
+import { apiInvoke, apiListen } from './utils/api';
 import DiskGauge, { formatBytes } from './components/DiskGauge';
 import SmartScanList from './components/SmartScanList';
 import FileTree from './components/FileTree';
@@ -80,8 +79,7 @@ export default function App() {
   useEffect(() => {
     let unlisten = null;
     const setupListener = async () => {
-      unlisten = await listen('scan-progress', (event) => {
-        const data = event.payload;
+      unlisten = await apiListen('scan-progress', (data) => {
         setScanProgress(data);
         if (!data.active) {
           setScanning(false);
@@ -101,7 +99,7 @@ export default function App() {
 
   const fetchDiskSpace = async () => {
     try {
-      const data = await invoke('get_disk_space');
+      const data = await apiInvoke('get_disk_space');
       setDiskSpace(data);
       if (!scanPath) {
         setScanPath(data.homeDir);
@@ -119,7 +117,7 @@ export default function App() {
     setSelectedPaths(new Map());
 
     try {
-      await invoke('start_scan', { scanPath });
+      await apiInvoke('start_scan', { scanPath });
       setLastScannedPath(scanPath);
     } catch (err) {
       alert(`Error starting scan: ${err}`);
@@ -129,7 +127,7 @@ export default function App() {
 
   const handleCancelScan = async () => {
     try {
-      await invoke('cancel_scan');
+      await apiInvoke('cancel_scan');
     } catch (e) {
       console.error('Cancel scan error:', e);
     }
@@ -137,7 +135,7 @@ export default function App() {
 
   const fetchScanResults = async () => {
     try {
-      const data = await invoke('get_scan_results');
+      const data = await apiInvoke('get_scan_results');
       setTreeData(data.tree);
       setTopFiles(data.topFiles);
       // Switch to tree tab once scan completes so user sees detail
@@ -250,7 +248,7 @@ export default function App() {
     }
 
     try {
-      const data = await invoke('delete_paths', { paths: pathsToDelete });
+      const data = await apiInvoke('delete_paths', { paths: pathsToDelete });
       
       setDeletionSummary(data);
       setSelectedPaths(new Map());
@@ -290,7 +288,7 @@ export default function App() {
     setDockerLoading(true);
     setDockerLog('Running docker system prune -af --volumes...\n');
     try {
-      const data = await invoke('run_docker_prune');
+      const data = await apiInvoke('run_docker_prune');
       if (!data.success) {
         setDockerLog(`Error: ${data.error || 'Unknown error'}\nDetails: ${data.log || ''}`);
       } else {
