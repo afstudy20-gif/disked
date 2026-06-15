@@ -43,26 +43,38 @@ let scanState = {
   error: null
 };
 
-// Concurrency limiter for file system operations to prevent EMFILE (too many open files)
 class ConcurrencyLimiter {
   constructor(max) {
     this.max = max;
     this.active = 0;
     this.queue = [];
   }
-  async run(fn) {
+  async run(fn, state) {
+    if (state && state.cancelled) {
+      return null;
+    }
     if (this.active >= this.max) {
-      await new Promise(resolve => this.queue.push(resolve));
+      await new Promise(resolve => this.queue.push({ resolve, state }));
+    }
+    if (state && state.cancelled) {
+      this.processQueue();
+      return null;
     }
     this.active++;
     try {
+      if (state && state.cancelled) {
+        return null;
+      }
       return await fn();
     } finally {
       this.active--;
-      if (this.queue.length > 0) {
-        const next = this.queue.shift();
-        next();
-      }
+      this.processQueue();
+    }
+  }
+  processQueue() {
+    if (this.queue.length > 0) {
+      const { resolve } = this.queue.shift();
+      resolve();
     }
   }
 }
@@ -248,7 +260,8 @@ async function scanDirectoryRecursive(dirPath, state) {
   const home = os.homedir();
 
   try {
-    const entries = await fsLimiter.run(() => fs.readdir(dirPath, { withFileTypes: true }));
+    const entries = await fsLimiter.run(() => fs.readdir(dirPath, { withFileTypes: true }), state);
+    if (!entries) return 0;
 
     const promises = entries.map(async (entry) => {
       if (state.cancelled) return null;
@@ -276,8 +289,8 @@ async function scanDirectoryRecursive(dirPath, state) {
 
         let mtime = new Date();
         try {
-          const stats = await fsLimiter.run(() => fs.lstat(fullPath));
-          mtime = stats.mtime;
+          const stats = await fsLimiter.run(() => fs.lstat(fullPath), state);
+          if (stats) mtime = stats.mtime;
         } catch (e) {}
 
         return {
@@ -289,7 +302,8 @@ async function scanDirectoryRecursive(dirPath, state) {
         };
       } else if (entry.isFile()) {
         try {
-          const stats = await fsLimiter.run(() => fs.lstat(fullPath));
+          const stats = await fsLimiter.run(() => fs.lstat(fullPath), state);
+          if (!stats) return null;
           const size = stats.blocks !== undefined ? Math.min(stats.size, stats.blocks * 512) : stats.size;
           
           state.filesScanned++;
@@ -348,7 +362,8 @@ async function scanDirectoryRecursive(dirPath, state) {
 async function getFolderSizeFast(dirPath, state) {
   let size = 0;
   try {
-    const entries = await fsLimiter.run(() => fs.readdir(dirPath, { withFileTypes: true }));
+    const entries = await fsLimiter.run(() => fs.readdir(dirPath, { withFileTypes: true }), state);
+    if (!entries) return 0;
     
     const promises = entries.map(async (entry) => {
       if (state.cancelled) return 0;
@@ -360,7 +375,8 @@ async function getFolderSizeFast(dirPath, state) {
         return await getFolderSizeFast(fullPath, state);
       } else if (entry.isFile()) {
         try {
-          const stats = await fsLimiter.run(() => fs.lstat(fullPath));
+          const stats = await fsLimiter.run(() => fs.lstat(fullPath), state);
+          if (!stats) return 0;
           const physicalSize = stats.blocks !== undefined ? Math.min(stats.size, stats.blocks * 512) : stats.size;
           
           state.filesScanned++;
