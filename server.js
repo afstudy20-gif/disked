@@ -37,7 +37,7 @@ if (authUser && authPass) {
   app.use((req, res, next) => {
     const authHeader = req.headers.authorization;
     if (!authHeader) {
-      res.setHeader('WWW-Authenticate', 'Basic realm="Secure Disk Analyzer"');
+      res.setHeader('WWW-Authenticate', 'Basic realm="disked"');
       return res.status(401).send('Authentication required');
     }
 
@@ -52,7 +52,7 @@ if (authUser && authPass) {
       }
     } catch (e) {}
 
-    res.setHeader('WWW-Authenticate', 'Basic realm="Secure Disk Analyzer"');
+    res.setHeader('WWW-Authenticate', 'Basic realm="disked"');
     return res.status(401).send('Authentication required');
   });
 }

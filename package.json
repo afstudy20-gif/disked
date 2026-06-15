@@ -1,5 +1,5 @@
 {
-  "name": "disk-analyzer-and-deleter",
+  "name": "disked",
   "version": "1.0.0",
   "description": "Scans local drives, analyzes cache/log/temp sizes, and safely deletes selected files.",
   "main": "server.js",

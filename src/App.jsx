@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { apiInvoke, apiListen } from './utils/api';
+import { apiInvoke, apiListen, isTauri } from './utils/api';
 import DiskGauge, { formatBytes } from './components/DiskGauge';
 import SmartScanList from './components/SmartScanList';
 import FileTree from './components/FileTree';
@@ -308,10 +308,29 @@ export default function App() {
       {/* Header */}
       <header className="app-header">
         <div className="header-title-group">
-          <h1><span>💾</span> Disk Analyzer & Deleter</h1>
-          <p>Local disk inspector & developer cache cleaner</p>
+          <h1><span>💾</span> disked</h1>
+          <p>Local disk inspector, server cleanup & developer cache cleaner</p>
         </div>
-        <div className="header-actions">
+        <div className="header-actions" style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
+          {!isTauri() && (
+            <a 
+              href="https://github.com/afstudy20-gif/disked/releases" 
+              target="_blank" 
+              rel="noopener noreferrer"
+              className="btn"
+              style={{ 
+                display: 'inline-flex', 
+                alignItems: 'center', 
+                gap: '0.3rem', 
+                textDecoration: 'none', 
+                background: 'var(--primary-color, #3b82f6)',
+                color: '#fff',
+                borderColor: 'transparent'
+              }}
+            >
+              📥 Download Desktop App
+            </a>
+          )}
           <button className="btn" onClick={fetchDiskSpace}>
             🔄 Refresh Disk
           </button>
