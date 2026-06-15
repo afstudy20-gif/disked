@@ -88,6 +88,8 @@ export const apiListen = async (eventName, callback) => {
       eventSource.onerror = (err) => {
         console.error('SSE EventSource error:', err);
         eventSource.close();
+        // If stream ended or failed, notify client that scanning is inactive so it stops loading
+        callback({ active: false });
       };
 
       // Return unlisten callback matching Tauri's API
