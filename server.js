@@ -3,7 +3,7 @@ import cors from 'cors';
 import { promises as fs } from 'fs';
 import { existsSync } from 'fs';
 import path from 'path';
-import { exec } from 'child_process';
+import { exec, execFile } from 'child_process';
 import { promisify } from 'util';
 import os from 'os';
 
@@ -20,6 +20,7 @@ if (process.platform === 'darwin') {
 }
 
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile); // no shell — safe for untrusted path args
 const app = express();
 const PORT = process.env.PORT || 5005;
 
@@ -694,6 +695,240 @@ app.post('/api/terminal/run', async (req, res) => {
       cwd: currentCwd
     });
   }
+});
+
+// ----------------- APP UNINSTALLER (macOS) -----------------
+
+// Library subdomains scanned for an app's leftover files (relative to ~/Library and /Library).
+// modes: name (== bundleId/appName/exec), id (== bundleId), group (contains bundleId),
+// pref (bundleId.* plist), saved (bundleId.savedState), cookie (bundleId.binarycookies)
+const LIBRARY_DOMAINS = [
+  ['Application Support', 'Application Support', 'name'],
+  ['Caches', 'Cache', 'name'],
+  ['Logs', 'Logs', 'name'],
+  ['Containers', 'Container', 'id'],
+  ['Application Scripts', 'App Scripts', 'id'],
+  ['WebKit', 'WebKit Data', 'id'],
+  ['HTTPStorages', 'HTTP Storage', 'id'],
+  ['Group Containers', 'Group Container', 'group'],
+  ['Preferences', 'Preferences', 'pref'],
+  ['Preferences/ByHost', 'Preferences (ByHost)', 'pref'],
+  ['SyncedPreferences', 'Synced Preferences', 'pref'],
+  ['Saved Application State', 'Saved State', 'saved'],
+  ['Cookies', 'Cookies', 'cookie'],
+  ['LaunchAgents', 'Launch Agent', 'pref']
+];
+
+// Extra domains only scanned under /Library (system-wide, typically need admin).
+const SYSTEM_DOMAINS = [
+  ['LaunchDaemons', 'Launch Daemon', 'pref'],
+  ['PrivilegedHelperTools', 'Helper Tool', 'id'],
+  ['Extensions', 'System Extension', 'name'],
+  ['StartupItems', 'Startup Item', 'name']
+];
+
+// Read a value from an app bundle's Info.plist via `defaults` (handles binary plists).
+async function readPlistValue(appPath, key) {
+  try {
+    const { stdout } = await execFileAsync('defaults', ['read', `${appPath}/Contents/Info`, key]);
+    const value = stdout.trim();
+    return value || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function entryMatches(name, bundleId, appName, exec, mode) {
+  const hasId = Boolean(bundleId);
+  switch (mode) {
+    case 'name': return name === appName || (hasId && name === bundleId) || (Boolean(exec) && name === exec);
+    case 'id': return hasId && name === bundleId;
+    case 'group': return hasId && name.includes(bundleId);
+    case 'pref': return hasId && (name === `${bundleId}.plist` || name.startsWith(`${bundleId}.`));
+    case 'saved': return hasId && name === `${bundleId}.savedState`;
+    case 'cookie': return hasId && name === `${bundleId}.binarycookies`;
+    default: return false;
+  }
+}
+
+async function scanDomain(dir, label, mode, ctx, needsAdmin, out) {
+  let entries;
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch (e) {
+    return;
+  }
+  for (const entry of entries) {
+    if (!entryMatches(entry.name, ctx.bundleId, ctx.appName, ctx.exec, mode)) continue;
+    const fullPath = path.join(dir, entry.name);
+    let size = 0;
+    try {
+      if (entry.isDirectory()) {
+        size = await getFolderSizeFast(fullPath, { cancelled: false });
+      } else {
+        const stats = await fs.lstat(fullPath);
+        size = stats.size;
+      }
+    } catch (e) {}
+    out.push({ path: fullPath, name: entry.name, size, category: label, isApp: false, needsAdmin });
+  }
+}
+
+async function collectApps(dir, apps, depth) {
+  let entries;
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch (e) {
+    return;
+  }
+  for (const entry of entries) {
+    if (entry.isSymbolicLink()) continue;
+    const fullPath = path.join(dir, entry.name);
+    if (entry.name.endsWith('.app')) {
+      const bundleId = await readPlistValue(fullPath, 'CFBundleIdentifier');
+      const version = await readPlistValue(fullPath, 'CFBundleShortVersionString');
+      const size = await getFolderSizeFast(fullPath, { cancelled: false });
+      apps.push({
+        name: entry.name.replace(/\.app$/, ''),
+        path: fullPath,
+        bundleId: bundleId || '',
+        version: version || '',
+        size
+      });
+    } else if (entry.isDirectory() && depth < 1) {
+      await collectApps(fullPath, apps, depth + 1);
+    }
+  }
+}
+
+// Relaxed safety check for uninstall: allow .app bundles + Library leftovers,
+// never critical roots or whole Library subdomain directories.
+function isSafeToUninstall(targetPath, home) {
+  const resolved = path.resolve(targetPath);
+  const forbidden = ['/', '/System', '/Library', '/Applications', '/Users', '/usr', '/bin', '/sbin', '/etc', '/var', '/private', '/opt', '/cores', '/dev'];
+  if (forbidden.includes(resolved)) return false;
+  if (resolved === home || resolved === path.join(home, 'Library') || resolved === path.join(home, 'Applications')) return false;
+
+  const userLib = path.join(home, 'Library');
+  for (const [sub] of [...LIBRARY_DOMAINS, ...SYSTEM_DOMAINS]) {
+    if (resolved === path.join(userLib, sub) || resolved === path.join('/Library', sub)) return false;
+  }
+
+  if (resolved.endsWith('.app') && (resolved.startsWith('/Applications' + path.sep) || resolved.startsWith(path.join(home, 'Applications') + path.sep))) {
+    return true;
+  }
+  if (resolved.includes(path.sep + 'Library' + path.sep)) return true;
+  return false;
+}
+
+// List installed applications
+app.get('/api/applications', async (req, res) => {
+  if (process.platform !== 'darwin') {
+    return res.json([]);
+  }
+  try {
+    const apps = [];
+    const roots = ['/Applications', path.join(os.homedir(), 'Applications')];
+    for (const root of roots) {
+      if (existsSync(root)) await collectApps(root, apps, 0);
+    }
+    const seen = new Set();
+    const unique = apps.filter((a) => (seen.has(a.path) ? false : (seen.add(a.path), true)));
+    unique.sort((a, b) => b.size - a.size);
+    res.json(unique);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Find an app's leftover files across Library domains
+app.post('/api/app-leftovers', async (req, res) => {
+  const { appPath } = req.body;
+  if (!appPath || !existsSync(appPath)) {
+    return res.status(400).json({ error: 'Application does not exist' });
+  }
+  if (!appPath.endsWith('.app')) {
+    return res.status(400).json({ error: 'Selected path is not an application bundle' });
+  }
+
+  try {
+    const appName = path.basename(appPath).replace(/\.app$/, '');
+    const bundleId = (await readPlistValue(appPath, 'CFBundleIdentifier')) || '';
+    const version = (await readPlistValue(appPath, 'CFBundleShortVersionString')) || '';
+    const exec = (await readPlistValue(appPath, 'CFBundleExecutable')) || '';
+    const appSize = await getFolderSizeFast(appPath, { cancelled: false });
+    const ctx = { bundleId, appName, exec };
+
+    const items = [{
+      path: appPath,
+      name: `${appName}.app`,
+      size: appSize,
+      category: 'Application',
+      isApp: true,
+      needsAdmin: appPath.startsWith('/Applications' + path.sep)
+    }];
+
+    const home = os.homedir();
+    const userLib = path.join(home, 'Library');
+    for (const [sub, label, mode] of LIBRARY_DOMAINS) {
+      await scanDomain(path.join(userLib, sub), label, mode, ctx, false, items);
+    }
+    for (const [sub, label, mode] of [...LIBRARY_DOMAINS, ...SYSTEM_DOMAINS]) {
+      await scanDomain(path.join('/Library', sub), label, mode, ctx, true, items);
+    }
+
+    const totalSize = items.reduce((sum, i) => sum + i.size, 0);
+    res.json({ app: { name: appName, path: appPath, bundleId, version, size: appSize }, items, totalSize });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Permanently remove an app + its selected leftovers
+app.post('/api/uninstall', async (req, res) => {
+  const { paths } = req.body;
+  if (!paths || !Array.isArray(paths) || paths.length === 0) {
+    return res.status(400).json({ error: 'No paths provided for uninstall' });
+  }
+
+  const home = os.homedir();
+  const results = [];
+  let spaceFreed = 0;
+
+  for (const targetPath of paths) {
+    const resolved = path.resolve(targetPath);
+
+    if (!existsSync(resolved)) {
+      results.push({ path: targetPath, status: 'skipped', size: 0, reason: 'Path does not exist' });
+      continue;
+    }
+    if (!isSafeToUninstall(resolved, home)) {
+      results.push({ path: targetPath, status: 'error', size: 0, reason: 'Protected location — refused' });
+      continue;
+    }
+
+    try {
+      const stats = await fs.lstat(resolved);
+      const isDir = stats.isDirectory();
+      const size = isDir ? await getFolderSizeFast(resolved, { cancelled: false }) : stats.size;
+
+      if (isDir) {
+        await fs.rm(resolved, { recursive: true, force: true });
+      } else {
+        await fs.unlink(resolved);
+      }
+
+      spaceFreed += size;
+      results.push({ path: targetPath, status: 'success', size, reason: '' });
+    } catch (err) {
+      const reason = (err.code === 'EACCES' || err.code === 'EPERM')
+        ? 'Permission denied — requires admin privileges'
+        : err.message;
+      results.push({ path: targetPath, status: 'error', size: 0, reason });
+    }
+  }
+
+  res.json({ message: 'Uninstall completed', results, spaceFreed });
 });
 
 // Serve static frontend files in production

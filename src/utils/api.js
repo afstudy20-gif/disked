@@ -16,6 +16,9 @@ export const apiInvoke = async (commandName, args = {}) => {
       'cancel_scan': { path: '/api/scan/cancel', method: 'POST' },
       'get_scan_results': { path: '/api/scan-results', method: 'GET' },
       'delete_paths': { path: '/api/delete', method: 'POST' },
+      'list_applications': { path: '/api/applications', method: 'GET' },
+      'find_app_leftovers': { path: '/api/app-leftovers', method: 'POST' },
+      'uninstall_paths': { path: '/api/uninstall', method: 'POST' },
       'get_smart_scan_targets': { path: '/api/smart-scan-targets', method: 'GET' },
       'run_docker_prune': { path: '/api/docker-prune', method: 'POST' },
       'run_terminal_command': { path: '/api/terminal/run', method: 'POST' }
@@ -37,8 +40,10 @@ export const apiInvoke = async (commandName, args = {}) => {
       let body = {};
       if (commandName === 'start_scan') {
         body.scanPath = args.scanPath;
-      } else if (commandName === 'delete_paths') {
+      } else if (commandName === 'delete_paths' || commandName === 'uninstall_paths') {
         body.paths = args.paths;
+      } else if (commandName === 'find_app_leftovers') {
+        body.appPath = args.appPath;
       } else if (commandName === 'run_terminal_command') {
         body.command = args.command;
         body.cwd = args.cwd;

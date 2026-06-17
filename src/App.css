@@ -1199,3 +1199,159 @@ button, input, select {
   animation: spin 0.8s linear infinite;
   margin-right: 0.25rem;
 }
+
+/* ---------------- App Uninstaller ---------------- */
+.uninstaller-grid {
+  display: grid;
+  grid-template-columns: minmax(220px, 320px) 1fr;
+  gap: 1rem;
+  min-height: 420px;
+}
+
+@media (max-width: 760px) {
+  .uninstaller-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.uninstaller-list,
+.uninstaller-detail {
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--border-light);
+  border-radius: 8px;
+  padding: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.uninstaller-app-rows {
+  overflow-y: auto;
+  max-height: 520px;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.uninstaller-app-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.6rem;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.uninstaller-app-row:hover {
+  background: var(--bg-card-hover);
+}
+
+.uninstaller-app-row.active {
+  background: var(--bg-card-hover);
+  border-color: var(--border-focus);
+}
+
+.uninstaller-app-name {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.uninstaller-app-meta {
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.uninstaller-app-size {
+  font-variant-numeric: tabular-nums;
+  font-size: 0.85rem;
+  white-space: nowrap;
+  color: var(--text-secondary);
+}
+
+.uninstaller-detail-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1rem;
+  padding-bottom: 0.6rem;
+  border-bottom: 1px solid var(--border-light);
+  margin-bottom: 0.6rem;
+}
+
+.uninstaller-items {
+  overflow-y: auto;
+  max-height: 430px;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  flex: 1;
+}
+
+.uninstaller-item {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.45rem 0.6rem;
+  border-radius: 6px;
+  border: 1px solid var(--border-light);
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.uninstaller-item:hover {
+  background: var(--bg-card-hover);
+}
+
+.uninstaller-item.selected {
+  border-color: var(--border-focus);
+}
+
+.uninstaller-item-name {
+  font-size: 0.86rem;
+  font-weight: 500;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+.uninstaller-item-path {
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.uninstaller-tag {
+  font-size: 0.62rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  background: var(--border-light);
+  color: var(--text-secondary);
+}
+
+.uninstaller-tag.admin {
+  background: var(--color-warning-glow);
+  color: var(--color-warning);
+}
+
+.uninstaller-actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  padding-top: 0.75rem;
+  margin-top: 0.5rem;
+  border-top: 1px solid var(--border-light);
+}

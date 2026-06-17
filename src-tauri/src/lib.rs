@@ -118,6 +118,36 @@ pub struct ScanResults {
     pub folders_count: u32,
 }
 
+#[derive(Serialize, Clone)]
+pub struct AppInfo {
+    pub name: String,
+    pub path: String,
+    #[serde(rename = "bundleId")]
+    pub bundle_id: String,
+    pub version: String,
+    pub size: u64,
+}
+
+#[derive(Serialize, Clone)]
+pub struct LeftoverItem {
+    pub path: String,
+    pub name: String,
+    pub size: u64,
+    pub category: String,
+    #[serde(rename = "isApp")]
+    pub is_app: bool,
+    #[serde(rename = "needsAdmin")]
+    pub needs_admin: bool,
+}
+
+#[derive(Serialize)]
+pub struct AppLeftovers {
+    pub app: AppInfo,
+    pub items: Vec<LeftoverItem>,
+    #[serde(rename = "totalSize")]
+    pub total_size: u64,
+}
+
 // ----------------- CONFIG & CONSTANTS -----------------
 
 const LEAF_DIRECTORIES: &[&str] = &[
@@ -436,6 +466,177 @@ fn is_safe_to_delete(path_str: &str, home_dir: &str) -> bool {
     false
 }
 
+// ----------------- APP UNINSTALLER HELPERS -----------------
+
+// Library subdomains scanned for an app's leftover files (relative to ~/Library and /Library).
+// match modes: "name" (== bundleId, appName, or executable), "id" (== bundleId only),
+// "group" (contains bundleId), "pref" (bundleId.* plist), "saved" (bundleId.savedState),
+// "cookie" (bundleId.binarycookies)
+const LIBRARY_DOMAINS: &[(&str, &str, &str)] = &[
+    ("Application Support", "Application Support", "name"),
+    ("Caches", "Cache", "name"),
+    ("Logs", "Logs", "name"),
+    ("Containers", "Container", "id"),
+    ("Application Scripts", "App Scripts", "id"),
+    ("WebKit", "WebKit Data", "id"),
+    ("HTTPStorages", "HTTP Storage", "id"),
+    ("Group Containers", "Group Container", "group"),
+    ("Preferences", "Preferences", "pref"),
+    ("Preferences/ByHost", "Preferences (ByHost)", "pref"),
+    ("SyncedPreferences", "Synced Preferences", "pref"),
+    ("Saved Application State", "Saved State", "saved"),
+    ("Cookies", "Cookies", "cookie"),
+    ("LaunchAgents", "Launch Agent", "pref"),
+];
+
+// Extra domains only scanned under /Library (system-wide, typically need admin).
+const SYSTEM_DOMAINS: &[(&str, &str, &str)] = &[
+    ("LaunchDaemons", "Launch Daemon", "pref"),
+    ("PrivilegedHelperTools", "Helper Tool", "id"),
+    ("Extensions", "System Extension", "name"),
+    ("StartupItems", "Startup Item", "name"),
+];
+
+// Read a value from an app bundle's Info.plist (handles binary plists via `defaults`).
+fn read_plist_value(app_path: &str, key: &str) -> Option<String> {
+    let info = format!("{}/Contents/Info", app_path);
+    let output = prepare_command("defaults").args(["read", &info, key]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn entry_matches(name: &str, bundle_id: &str, app_name: &str, exec: &str, mode: &str) -> bool {
+    let has_id = !bundle_id.is_empty();
+    match mode {
+        "name" => name == app_name || (has_id && name == bundle_id) || (!exec.is_empty() && name == exec),
+        "id" => has_id && name == bundle_id,
+        "group" => has_id && name.contains(bundle_id),
+        "pref" => has_id && (name == format!("{}.plist", bundle_id) || name.starts_with(&format!("{}.", bundle_id))),
+        "saved" => has_id && name == format!("{}.savedState", bundle_id),
+        "cookie" => has_id && name == format!("{}.binarycookies", bundle_id),
+        _ => false,
+    }
+}
+
+// Scan a single Library subdomain directory for entries matching the target app.
+fn scan_domain(
+    dir: &Path,
+    domain_label: &str,
+    mode: &str,
+    bundle_id: &str,
+    app_name: &str,
+    exec: &str,
+    needs_admin: bool,
+    cancelled: &Arc<AtomicBool>,
+    out: &mut Vec<LeftoverItem>,
+) {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !entry_matches(&name, bundle_id, app_name, exec, mode) {
+            continue;
+        }
+        let path = entry.path();
+        let size = match entry.file_type() {
+            Ok(ft) if ft.is_dir() => get_folder_size_fast(&path, cancelled),
+            Ok(_) => entry.metadata().map(|m| m.len()).unwrap_or(0),
+            Err(_) => 0,
+        };
+        out.push(LeftoverItem {
+            path: path.to_string_lossy().to_string(),
+            name,
+            size,
+            category: domain_label.to_string(),
+            is_app: false,
+            needs_admin,
+        });
+    }
+}
+
+// Recursively collect .app bundles (one level deep into containers like /Applications/Utilities).
+fn collect_apps(dir: &Path, apps: &mut Vec<AppInfo>, cancelled: &Arc<AtomicBool>, depth: u32) {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.ends_with(".app") {
+            let path_str = path.to_string_lossy().to_string();
+            apps.push(AppInfo {
+                name: name.trim_end_matches(".app").to_string(),
+                bundle_id: read_plist_value(&path_str, "CFBundleIdentifier").unwrap_or_default(),
+                version: read_plist_value(&path_str, "CFBundleShortVersionString").unwrap_or_default(),
+                size: get_folder_size_fast(&path, cancelled),
+                path: path_str,
+            });
+        } else if file_type.is_dir() && depth < 1 {
+            collect_apps(&path, apps, cancelled, depth + 1);
+        }
+    }
+}
+
+// Relaxed safety check for uninstall: allows .app bundles and Library leftovers,
+// but never the critical roots or whole Library subdomain directories themselves.
+fn is_safe_to_uninstall(path_str: &str, home_dir: &str) -> bool {
+    let resolved = match Path::new(path_str).canonicalize() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let ts = resolved.to_string_lossy().to_string();
+
+    let forbidden = [
+        "/", "/System", "/Library", "/Applications", "/Users", "/usr", "/bin", "/sbin",
+        "/etc", "/var", "/private", "/opt", "/cores", "/dev",
+    ];
+    if forbidden.contains(&ts.as_str()) {
+        return false;
+    }
+    if ts == home_dir || ts == format!("{}/Library", home_dir) || ts == format!("{}/Applications", home_dir) {
+        return false;
+    }
+
+    // Never allow deleting a whole Library subdomain root (e.g. ~/Library/Caches).
+    let user_lib = format!("{}/Library", home_dir);
+    for (sub, _, _) in LIBRARY_DOMAINS.iter().chain(SYSTEM_DOMAINS.iter()) {
+        if ts == format!("{}/{}", user_lib, sub) || ts == format!("/Library/{}", sub) {
+            return false;
+        }
+    }
+
+    // Allow .app bundles under an Applications directory.
+    if ts.ends_with(".app")
+        && (ts.starts_with("/Applications/") || ts.starts_with(&format!("{}/Applications/", home_dir)))
+    {
+        return true;
+    }
+
+    // Allow leftover items that live inside a Library directory.
+    if ts.contains("/Library/") {
+        return true;
+    }
+
+    false
+}
+
 // ----------------- TAURI COMMANDS -----------------
 
 #[tauri::command]
@@ -726,6 +927,163 @@ fn delete_paths(paths: Vec<String>, app_handle: AppHandle) -> DeletionSummary {
 }
 
 #[tauri::command]
+fn list_applications(app_handle: AppHandle) -> Vec<AppInfo> {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let mut apps: Vec<AppInfo> = Vec::new();
+
+    let mut roots = vec![PathBuf::from("/Applications")];
+    if let Ok(home) = app_handle.path().home_dir() {
+        roots.push(home.join("Applications"));
+    }
+
+    for root in roots {
+        if root.exists() {
+            collect_apps(&root, &mut apps, &cancelled, 0);
+        }
+    }
+
+    // De-duplicate by path, then sort largest first.
+    apps.sort_by(|a, b| a.path.cmp(&b.path));
+    apps.dedup_by(|a, b| a.path == b.path);
+    apps.sort_by(|a, b| b.size.cmp(&a.size));
+    apps
+}
+
+#[tauri::command]
+fn find_app_leftovers(app_path: String, app_handle: AppHandle) -> Result<AppLeftovers, String> {
+    let p = Path::new(&app_path);
+    if !p.exists() {
+        return Err("Application does not exist".to_string());
+    }
+    if !app_path.ends_with(".app") {
+        return Err("Selected path is not an application bundle".to_string());
+    }
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let app_name = p
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.trim_end_matches(".app").to_string())
+        .unwrap_or_default();
+    let bundle_id = read_plist_value(&app_path, "CFBundleIdentifier").unwrap_or_default();
+    let version = read_plist_value(&app_path, "CFBundleShortVersionString").unwrap_or_default();
+    let exec = read_plist_value(&app_path, "CFBundleExecutable").unwrap_or_default();
+    let app_size = get_folder_size_fast(p, &cancelled);
+
+    let mut items: Vec<LeftoverItem> = vec![LeftoverItem {
+        path: app_path.clone(),
+        name: format!("{}.app", app_name),
+        size: app_size,
+        category: "Application".to_string(),
+        is_app: true,
+        needs_admin: app_path.starts_with("/Applications/"),
+    }];
+
+    let home = app_handle.path().home_dir().map_err(|_| "Home directory not found".to_string())?;
+
+    // User domains (~/Library) — no admin required.
+    let user_lib = home.join("Library");
+    for (sub, label, mode) in LIBRARY_DOMAINS {
+        scan_domain(
+            &user_lib.join(sub), label, mode, &bundle_id, &app_name, &exec, false, &cancelled, &mut items,
+        );
+    }
+
+    // System domains (/Library) — typically need admin to remove.
+    let sys_lib = Path::new("/Library");
+    for (sub, label, mode) in LIBRARY_DOMAINS.iter().chain(SYSTEM_DOMAINS.iter()) {
+        scan_domain(
+            &sys_lib.join(sub), label, mode, &bundle_id, &app_name, &exec, true, &cancelled, &mut items,
+        );
+    }
+
+    let total_size = items.iter().map(|i| i.size).sum();
+
+    Ok(AppLeftovers {
+        app: AppInfo { name: app_name, path: app_path, bundle_id, version, size: app_size },
+        items,
+        total_size,
+    })
+}
+
+#[tauri::command]
+fn uninstall_paths(paths: Vec<String>, app_handle: AppHandle) -> DeletionSummary {
+    let home = app_handle.path().home_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    let home_dir_str = home.to_string_lossy().to_string();
+
+    let mut results = Vec::new();
+    let mut space_freed = 0u64;
+    let cancelled = Arc::new(AtomicBool::new(false));
+
+    for target_path_str in paths {
+        let p = Path::new(&target_path_str);
+        if !p.exists() {
+            results.push(DeletionItemResult {
+                path: target_path_str.clone(),
+                status: "skipped".to_string(),
+                size: 0,
+                reason: "Path does not exist".to_string(),
+            });
+            continue;
+        }
+
+        if !is_safe_to_uninstall(&target_path_str, &home_dir_str) {
+            results.push(DeletionItemResult {
+                path: target_path_str.clone(),
+                status: "error".to_string(),
+                size: 0,
+                reason: "Protected location — refused".to_string(),
+            });
+            continue;
+        }
+
+        let metadata = match p.symlink_metadata() {
+            Ok(m) => m,
+            Err(e) => {
+                results.push(DeletionItemResult {
+                    path: target_path_str.clone(),
+                    status: "error".to_string(),
+                    size: 0,
+                    reason: e.to_string(),
+                });
+                continue;
+            }
+        };
+
+        let is_dir = metadata.is_dir();
+        let size = if is_dir { get_folder_size_fast(p, &cancelled) } else { metadata.len() };
+
+        let outcome = if is_dir { fs::remove_dir_all(p) } else { fs::remove_file(p) };
+        match outcome {
+            Ok(_) => {
+                space_freed += size;
+                results.push(DeletionItemResult {
+                    path: target_path_str.clone(),
+                    status: "success".to_string(),
+                    size,
+                    reason: "".to_string(),
+                });
+            }
+            Err(e) => {
+                let reason = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    "Permission denied — requires admin privileges".to_string()
+                } else {
+                    e.to_string()
+                };
+                results.push(DeletionItemResult {
+                    path: target_path_str.clone(),
+                    status: "error".to_string(),
+                    size: 0,
+                    reason,
+                });
+            }
+        }
+    }
+
+    DeletionSummary { message: "Uninstall completed".to_string(), results, space_freed }
+}
+
+#[tauri::command]
 fn get_smart_scan_targets(app_handle: AppHandle) -> Vec<SmartTarget> {
     let home = app_handle.path().home_dir().unwrap_or_else(|_| PathBuf::from("/"));
     let mut targets = Vec::new();
@@ -986,6 +1344,9 @@ pub fn run() {
             cancel_scan,
             get_scan_results,
             delete_paths,
+            list_applications,
+            find_app_leftovers,
+            uninstall_paths,
             get_smart_scan_targets,
             run_docker_prune,
             run_terminal_command

@@ -5,6 +5,7 @@ import SmartScanList from './components/SmartScanList';
 import FileTree from './components/FileTree';
 import LargestFiles from './components/LargestFiles';
 import TerminalConsole from './components/TerminalConsole';
+import AppUninstaller from './components/AppUninstaller';
 
 export default function App() {
   // Tabs: 'smart', 'explorer', 'largest'
@@ -441,11 +442,17 @@ export default function App() {
               >
                 🔥 Top 100 Largest Files
               </button>
-              <button 
+              <button
                 className={`tab-btn ${activeTab === 'terminal' ? 'active' : ''}`}
                 onClick={() => setActiveTab('terminal')}
               >
                 💻 Interactive Terminal
+              </button>
+              <button
+                className={`tab-btn ${activeTab === 'uninstall' ? 'active' : ''}`}
+                onClick={() => setActiveTab('uninstall')}
+              >
+                🗑️ App Uninstaller
               </button>
             </div>
 
@@ -478,6 +485,10 @@ export default function App() {
 
               {activeTab === 'terminal' && (
                 <TerminalConsole />
+              )}
+
+              {activeTab === 'uninstall' && (
+                <AppUninstaller onUninstalled={fetchDiskSpace} />
               )}
             </div>
           </div>
