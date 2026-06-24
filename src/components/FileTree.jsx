@@ -1,10 +1,38 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { formatBytes } from './DiskGauge';
+import { apiInvoke } from '../utils/api';
 
 export default function FileTree({ treeData, rootPath, selectedPaths, togglePathSelection }) {
   const [expandedPaths, setExpandedPaths] = useState(new Set());
   const [sortBy, setSortBy] = useState('size'); // 'size' | 'name' | 'date'
   const [sortOrder, setSortOrder] = useState('desc'); // 'asc' | 'desc'
+  const [contextMenu, setContextMenu] = useState(null); // { x, y, path }
+
+  useEffect(() => {
+    if (!contextMenu) return;
+    const close = () => setContextMenu(null);
+    window.addEventListener('click', close);
+    window.addEventListener('scroll', close, true);
+    return () => {
+      window.removeEventListener('click', close);
+      window.removeEventListener('scroll', close, true);
+    };
+  }, [contextMenu]);
+
+  const openContextMenu = (e, path) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setContextMenu({ x: e.clientX, y: e.clientY, path });
+  };
+
+  const revealInExplorer = async (targetPath) => {
+    setContextMenu(null);
+    try {
+      await apiInvoke('reveal_in_explorer', { targetPath });
+    } catch (err) {
+      alert(`Diskte gösterilemedi: ${err.message || err}`);
+    }
+  };
 
   const toggleExpand = (path, e) => {
     if (e) e.stopPropagation();
@@ -50,9 +78,10 @@ export default function FileTree({ treeData, rootPath, selectedPaths, togglePath
 
     return (
       <div key={nodePath} className="tree-node" style={{ paddingLeft: `${depth > 0 ? 16 : 0}px` }}>
-        <div 
+        <div
           className={`tree-row ${selectedPaths.has(nodePath) ? 'selected' : ''}`}
           onClick={(e) => toggleExpand(nodePath, e)} // Clicking folder row expands/collapses it
+          onContextMenu={(e) => openContextMenu(e, nodePath)}
           style={{ cursor: 'pointer' }}
         >
           <div className="tree-node-left">
@@ -99,11 +128,12 @@ export default function FileTree({ treeData, rootPath, selectedPaths, togglePath
               // If it's a file, render a simple row that selects on click
               const isChildChecked = selectedPaths.has(child.path);
               return (
-                <div 
-                  key={child.path} 
+                <div
+                  key={child.path}
                   className={`tree-row ${isChildChecked ? 'selected' : ''}`}
                   style={{ paddingLeft: `${(depth + 1) * 16 + 16}px` }}
                   onClick={() => togglePathSelection(child.path, child.size)} // Files select directly on row click
+                  onContextMenu={(e) => openContextMenu(e, child.path)}
                 >
                   <div className="tree-node-left">
                     <span style={{ width: '16px' }}></span>
@@ -178,6 +208,19 @@ export default function FileTree({ treeData, rootPath, selectedPaths, togglePath
       <div className="file-tree-container">
         {renderNode(rootPath)}
       </div>
+
+      {contextMenu && (
+        <div
+          className="ctx-menu"
+          style={{ top: contextMenu.y, left: contextMenu.x }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <button className="ctx-menu-item" onClick={() => revealInExplorer(contextMenu.path)}>
+            📂 Diskte göster
+          </button>
+          <div className="ctx-menu-path" title={contextMenu.path}>{contextMenu.path}</div>
+        </div>
+      )}
     </div>
   );
 }

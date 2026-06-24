@@ -931,6 +931,30 @@ app.post('/api/uninstall', async (req, res) => {
   res.json({ message: 'Uninstall completed', results, spaceFreed });
 });
 
+// Reveal a path in the OS file manager. Useful in desktop builds; in web mode
+// this runs on the server host, so it generally won't open anything visible
+// to the user — the frontend only calls it from a Tauri context.
+app.post('/api/reveal', async (req, res) => {
+  const { targetPath } = req.body;
+  if (!targetPath || !existsSync(targetPath)) {
+    return res.status(400).json({ error: 'Path does not exist' });
+  }
+  try {
+    if (process.platform === 'darwin') {
+      await execFileAsync('open', ['-R', targetPath]);
+    } else if (process.platform === 'win32') {
+      await execFileAsync('explorer', [`/select,${targetPath}`]).catch(() => {});
+    } else {
+      const stats = await fs.lstat(targetPath);
+      const dir = stats.isDirectory() ? targetPath : path.dirname(targetPath);
+      await execFileAsync('xdg-open', [dir]);
+    }
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Serve static frontend files in production
 const distPath = path.resolve('dist');
 if (existsSync(distPath)) {

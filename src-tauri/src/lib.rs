@@ -7,6 +7,30 @@ use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 
+#[cfg(target_os = "windows")]
+use std::os::windows::fs::MetadataExt;
+
+// Windows cloud-placeholder & remote-recall attribute bits. A file with any of
+// these set is not fully present on local disk (OneDrive Files On-Demand,
+// remote storage, etc.) and must be skipped from size accounting.
+#[cfg(target_os = "windows")]
+const FILE_ATTRIBUTE_OFFLINE: u32 = 0x1000;
+#[cfg(target_os = "windows")]
+const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x40000;
+#[cfg(target_os = "windows")]
+const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x400000;
+
+#[cfg(target_os = "windows")]
+fn is_cloud_placeholder(meta: &fs::Metadata) -> bool {
+    let attrs = meta.file_attributes();
+    attrs & (FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS) != 0
+}
+
+#[cfg(not(target_os = "windows"))]
+fn is_cloud_placeholder(_meta: &fs::Metadata) -> bool {
+    false
+}
+
 // ----------------- DATA STRUCTURES -----------------
 
 #[derive(Clone, Serialize)]
@@ -247,6 +271,9 @@ fn get_folder_size_fast(dir_path: &Path, cancelled: &Arc<AtomicBool>) -> u64 {
                     total_size += get_folder_size_fast(&entry.path(), cancelled);
                 } else if file_type.is_file() {
                     if let Ok(metadata) = entry.metadata() {
+                        if is_cloud_placeholder(&metadata) {
+                            continue;
+                        }
                         total_size += metadata.len();
                     }
                 }
@@ -341,9 +368,12 @@ fn scan_directory_recursive(
                     });
                 } else if file_type.is_file() {
                     if let Ok(metadata) = entry.metadata() {
+                        if is_cloud_placeholder(&metadata) {
+                            continue;
+                        }
                         let size = metadata.len();
                         total_size += size;
-                        
+
                         let mtime = metadata.modified().ok()
                             .map(get_epoch_millis)
                             .unwrap_or(0);
@@ -1084,6 +1114,48 @@ fn uninstall_paths(paths: Vec<String>, app_handle: AppHandle) -> DeletionSummary
 }
 
 #[tauri::command]
+fn reveal_in_explorer(target_path: String) -> Result<(), String> {
+    let path = Path::new(&target_path);
+    if !path.exists() {
+        return Err(format!("Path does not exist: {}", target_path));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        prepare_command("open")
+            .args(["-R", &target_path])
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // /select, highlights the file/folder inside its parent in Explorer.
+        std::process::Command::new("explorer")
+            .arg(format!("/select,{}", target_path))
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let dir = if path.is_dir() {
+            target_path.clone()
+        } else {
+            path.parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| ".".to_string())
+        };
+        prepare_command("xdg-open")
+            .arg(&dir)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
 fn get_smart_scan_targets(app_handle: AppHandle) -> Vec<SmartTarget> {
     let home = app_handle.path().home_dir().unwrap_or_else(|_| PathBuf::from("/"));
     let mut targets = Vec::new();
@@ -1347,6 +1419,7 @@ pub fn run() {
             list_applications,
             find_app_leftovers,
             uninstall_paths,
+            reveal_in_explorer,
             get_smart_scan_targets,
             run_docker_prune,
             run_terminal_command
