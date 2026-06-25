@@ -738,6 +738,19 @@ async function readPlistValue(appPath, key) {
   }
 }
 
+// Derive vendor/app tokens from a bundleId. `com.google.Chrome` -> ["google","chrome"].
+// Reverse-DNS prefixes (com/org/io/net/...) are dropped; an Apple-style team prefix
+// like `2BUA8C4S2C.com.agilebits.onepassword` keeps the team id as the first token.
+function bundleTokens(bundleId) {
+  if (!bundleId) return [];
+  const tlds = new Set(['com', 'org', 'io', 'net', 'co', 'me', 'app', 'dev', 'us']);
+  return bundleId
+    .split('.')
+    .filter((seg, i) => !(i === 0 && tlds.has(seg.toLowerCase())))
+    .map((s) => s.toLowerCase())
+    .filter(Boolean);
+}
+
 function entryMatches(name, bundleId, appName, exec, mode) {
   const hasId = Boolean(bundleId);
   switch (mode) {
@@ -751,7 +764,18 @@ function entryMatches(name, bundleId, appName, exec, mode) {
   }
 }
 
-async function scanDomain(dir, label, mode, ctx, needsAdmin, out) {
+async function pushLeftover(fullPath, name, label, needsAdmin, out, seen) {
+  if (seen.has(fullPath)) return;
+  seen.add(fullPath);
+  let size = 0;
+  try {
+    const stats = await fs.lstat(fullPath);
+    size = stats.isDirectory() ? await getFolderSizeFast(fullPath, { cancelled: false }) : stats.size;
+  } catch (e) {}
+  out.push({ path: fullPath, name, size, category: label, isApp: false, needsAdmin });
+}
+
+async function scanDomain(dir, label, mode, ctx, needsAdmin, out, seen) {
   let entries;
   try {
     entries = await fs.readdir(dir, { withFileTypes: true });
@@ -759,18 +783,33 @@ async function scanDomain(dir, label, mode, ctx, needsAdmin, out) {
     return;
   }
   for (const entry of entries) {
-    if (!entryMatches(entry.name, ctx.bundleId, ctx.appName, ctx.exec, mode)) continue;
-    const fullPath = path.join(dir, entry.name);
-    let size = 0;
+    if (entryMatches(entry.name, ctx.bundleId, ctx.appName, ctx.exec, mode)) {
+      await pushLeftover(path.join(dir, entry.name), entry.name, label, needsAdmin, out, seen);
+      continue;
+    }
+    // Vendor-nested: when scanning a "name" domain, also descend one level into a
+    // folder whose name matches a bundleId token (vendor) and look for an inner
+    // folder matching the app name or a later token. AppCleaner does the same —
+    // catches Chrome at ~/Library/Application Support/Google/Chrome.
+    if (mode !== 'name' || !entry.isDirectory() || ctx.tokens.length === 0) continue;
+    const lname = entry.name.toLowerCase();
+    if (!ctx.tokens.includes(lname)) continue;
+    let inner;
     try {
-      if (entry.isDirectory()) {
-        size = await getFolderSizeFast(fullPath, { cancelled: false });
-      } else {
-        const stats = await fs.lstat(fullPath);
-        size = stats.size;
-      }
-    } catch (e) {}
-    out.push({ path: fullPath, name: entry.name, size, category: label, isApp: false, needsAdmin });
+      inner = await fs.readdir(path.join(dir, entry.name), { withFileTypes: true });
+    } catch (e) {
+      continue;
+    }
+    for (const sub of inner) {
+      if (!sub.isDirectory()) continue;
+      const lsub = sub.name.toLowerCase();
+      const matches = lsub === ctx.appName.toLowerCase() ||
+                      ctx.tokens.slice(1).includes(lsub) ||
+                      lsub === ctx.tokens[ctx.tokens.length - 1];
+      if (!matches) continue;
+      const sp = path.join(dir, entry.name, sub.name);
+      await pushLeftover(sp, `${entry.name}/${sub.name}`, label, needsAdmin, out, seen);
+    }
   }
 }
 
@@ -857,7 +896,8 @@ app.post('/api/app-leftovers', async (req, res) => {
     const version = (await readPlistValue(appPath, 'CFBundleShortVersionString')) || '';
     const exec = (await readPlistValue(appPath, 'CFBundleExecutable')) || '';
     const appSize = await getFolderSizeFast(appPath, { cancelled: false });
-    const ctx = { bundleId, appName, exec };
+    const ctx = { bundleId, appName, exec, tokens: bundleTokens(bundleId) };
+    const seen = new Set([appPath]);
 
     const items = [{
       path: appPath,
@@ -871,10 +911,10 @@ app.post('/api/app-leftovers', async (req, res) => {
     const home = os.homedir();
     const userLib = path.join(home, 'Library');
     for (const [sub, label, mode] of LIBRARY_DOMAINS) {
-      await scanDomain(path.join(userLib, sub), label, mode, ctx, false, items);
+      await scanDomain(path.join(userLib, sub), label, mode, ctx, false, items, seen);
     }
     for (const [sub, label, mode] of [...LIBRARY_DOMAINS, ...SYSTEM_DOMAINS]) {
-      await scanDomain(path.join('/Library', sub), label, mode, ctx, true, items);
+      await scanDomain(path.join('/Library', sub), label, mode, ctx, true, items, seen);
     }
 
     const totalSize = items.reduce((sum, i) => sum + i.size, 0);

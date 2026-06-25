@@ -542,6 +542,22 @@ fn read_plist_value(app_path: &str, key: &str) -> Option<String> {
     }
 }
 
+// Derive vendor/app tokens from a bundleId. `com.google.Chrome` -> ["google","chrome"].
+// Reverse-DNS prefixes (com/org/io/net/...) are dropped.
+fn bundle_tokens(bundle_id: &str) -> Vec<String> {
+    if bundle_id.is_empty() {
+        return Vec::new();
+    }
+    let tlds = ["com", "org", "io", "net", "co", "me", "app", "dev", "us"];
+    bundle_id
+        .split('.')
+        .enumerate()
+        .filter(|(i, seg)| !(*i == 0 && tlds.contains(&seg.to_lowercase().as_str())))
+        .map(|(_, s)| s.to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 fn entry_matches(name: &str, bundle_id: &str, app_name: &str, exec: &str, mode: &str) -> bool {
     let has_id = !bundle_id.is_empty();
     match mode {
@@ -555,7 +571,38 @@ fn entry_matches(name: &str, bundle_id: &str, app_name: &str, exec: &str, mode: 
     }
 }
 
+fn push_leftover(
+    path: &Path,
+    name: &str,
+    label: &str,
+    needs_admin: bool,
+    cancelled: &Arc<AtomicBool>,
+    out: &mut Vec<LeftoverItem>,
+    seen: &mut std::collections::HashSet<String>,
+) {
+    let path_str = path.to_string_lossy().to_string();
+    if !seen.insert(path_str.clone()) {
+        return;
+    }
+    let size = match fs::symlink_metadata(path) {
+        Ok(m) if m.is_dir() => get_folder_size_fast(path, cancelled),
+        Ok(m) => m.len(),
+        Err(_) => 0,
+    };
+    out.push(LeftoverItem {
+        path: path_str,
+        name: name.to_string(),
+        size,
+        category: label.to_string(),
+        is_app: false,
+        needs_admin,
+    });
+}
+
 // Scan a single Library subdomain directory for entries matching the target app.
+// For "name"-mode domains we also descend one level into vendor folders (matching
+// a bundleId token) and look for an inner folder matching the app name — this is
+// how AppCleaner finds Chrome at ~/Library/Application Support/Google/Chrome.
 fn scan_domain(
     dir: &Path,
     domain_label: &str,
@@ -563,9 +610,11 @@ fn scan_domain(
     bundle_id: &str,
     app_name: &str,
     exec: &str,
+    tokens: &[String],
     needs_admin: bool,
     cancelled: &Arc<AtomicBool>,
     out: &mut Vec<LeftoverItem>,
+    seen: &mut std::collections::HashSet<String>,
 ) {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
@@ -573,23 +622,43 @@ fn scan_domain(
     };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        if !entry_matches(&name, bundle_id, app_name, exec, mode) {
+        if entry_matches(&name, bundle_id, app_name, exec, mode) {
+            push_leftover(&entry.path(), &name, domain_label, needs_admin, cancelled, out, seen);
             continue;
         }
-        let path = entry.path();
-        let size = match entry.file_type() {
-            Ok(ft) if ft.is_dir() => get_folder_size_fast(&path, cancelled),
-            Ok(_) => entry.metadata().map(|m| m.len()).unwrap_or(0),
-            Err(_) => 0,
+        if mode != "name" || tokens.is_empty() {
+            continue;
+        }
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if !is_dir {
+            continue;
+        }
+        let lname = name.to_lowercase();
+        if !tokens.contains(&lname) {
+            continue;
+        }
+        // Vendor folder match — look one level deeper for an app-name match.
+        let inner = match fs::read_dir(entry.path()) {
+            Ok(e) => e,
+            Err(_) => continue,
         };
-        out.push(LeftoverItem {
-            path: path.to_string_lossy().to_string(),
-            name,
-            size,
-            category: domain_label.to_string(),
-            is_app: false,
-            needs_admin,
-        });
+        let app_lower = app_name.to_lowercase();
+        for sub in inner.flatten() {
+            let is_sub_dir = sub.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            if !is_sub_dir {
+                continue;
+            }
+            let sname = sub.file_name().to_string_lossy().to_string();
+            let lsub = sname.to_lowercase();
+            let matches = lsub == app_lower
+                || tokens.iter().skip(1).any(|t| *t == lsub)
+                || tokens.last().map(|t| *t == lsub).unwrap_or(false);
+            if !matches {
+                continue;
+            }
+            let label_name = format!("{}/{}", name, sname);
+            push_leftover(&sub.path(), &label_name, domain_label, needs_admin, cancelled, out, seen);
+        }
     }
 }
 
@@ -1000,6 +1069,10 @@ fn find_app_leftovers(app_path: String, app_handle: AppHandle) -> Result<AppLeft
     let exec = read_plist_value(&app_path, "CFBundleExecutable").unwrap_or_default();
     let app_size = get_folder_size_fast(p, &cancelled);
 
+    let tokens = bundle_tokens(&bundle_id);
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    seen.insert(app_path.clone());
+
     let mut items: Vec<LeftoverItem> = vec![LeftoverItem {
         path: app_path.clone(),
         name: format!("{}.app", app_name),
@@ -1015,7 +1088,8 @@ fn find_app_leftovers(app_path: String, app_handle: AppHandle) -> Result<AppLeft
     let user_lib = home.join("Library");
     for (sub, label, mode) in LIBRARY_DOMAINS {
         scan_domain(
-            &user_lib.join(sub), label, mode, &bundle_id, &app_name, &exec, false, &cancelled, &mut items,
+            &user_lib.join(sub), label, mode, &bundle_id, &app_name, &exec, &tokens,
+            false, &cancelled, &mut items, &mut seen,
         );
     }
 
@@ -1023,7 +1097,8 @@ fn find_app_leftovers(app_path: String, app_handle: AppHandle) -> Result<AppLeft
     let sys_lib = Path::new("/Library");
     for (sub, label, mode) in LIBRARY_DOMAINS.iter().chain(SYSTEM_DOMAINS.iter()) {
         scan_domain(
-            &sys_lib.join(sub), label, mode, &bundle_id, &app_name, &exec, true, &cancelled, &mut items,
+            &sys_lib.join(sub), label, mode, &bundle_id, &app_name, &exec, &tokens,
+            true, &cancelled, &mut items, &mut seen,
         );
     }
 
