@@ -6,6 +6,7 @@ import FileTree from './components/FileTree';
 import LargestFiles from './components/LargestFiles';
 import TerminalConsole from './components/TerminalConsole';
 import AppUninstaller from './components/AppUninstaller';
+import DuplicatesFinder from './components/DuplicatesFinder';
 
 export default function App() {
   // Tabs: 'smart', 'explorer', 'largest'
@@ -29,13 +30,46 @@ export default function App() {
     currentPath: '',
     foldersScanned: 0,
     filesScanned: 0,
-    totalSizeCalculated: 0
+    totalSizeCalculated: 0,
+    permissionErrors: 0
   });
 
   // Scan Results
   const [treeData, setTreeData] = useState(null);
   const [topFiles, setTopFiles] = useState([]);
   const [lastScannedPath, setLastScannedPath] = useState('');
+  const [scanErrors, setScanErrors] = useState(0);
+
+  const exportToJson = (data, filename) => {
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const exportTopFilesToCsv = (files, filename) => {
+    const rows = [
+      ['Name', 'Path', 'Size (bytes)', 'Size (human)', 'Modified'],
+      ...files.map(f => [
+        f.name,
+        f.path,
+        f.size,
+        formatBytes(f.size),
+        f.updatedAt ? new Date(f.updatedAt).toISOString() : ''
+      ])
+    ];
+    const csv = rows.map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\n');
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
 
   // Selection Drawer State
   const [selectedPaths, setSelectedPaths] = useState(new Map()); // Path -> Size
@@ -115,6 +149,7 @@ export default function App() {
     setScanning(true);
     setTreeData(null);
     setTopFiles([]);
+    setScanErrors(0);
     setSelectedPaths(new Map());
 
     try {
@@ -139,6 +174,7 @@ export default function App() {
       const data = await apiInvoke('get_scan_results');
       setTreeData(data.tree);
       setTopFiles(data.topFiles);
+      setScanErrors(data.permissionErrors || 0);
       // Switch to tree tab once scan completes so user sees detail
       setActiveTab('explorer');
     } catch (err) {
@@ -393,6 +429,19 @@ export default function App() {
                 <div className="scan-progress-current-path" title={scanProgress.currentPath}>
                   {scanProgress.currentPath}
                 </div>
+                {(scanProgress.permissionErrors > 0 || scanErrors > 0) && (
+                  <div className="scan-error-banner" style={{
+                    marginTop: '0.75rem',
+                    padding: '0.5rem 0.75rem',
+                    background: 'rgba(245, 158, 11, 0.1)',
+                    border: '1px solid rgba(245, 158, 11, 0.3)',
+                    borderRadius: '6px',
+                    color: '#fbbf24',
+                    fontSize: '0.82rem'
+                  }}>
+                    ⚠️ {(scanProgress.permissionErrors || scanErrors).toLocaleString()} location(s) could not be read (permission denied). Results may be incomplete.
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -454,6 +503,12 @@ export default function App() {
               >
                 🗑️ App Uninstaller
               </button>
+              <button
+                className={`tab-btn ${activeTab === 'duplicates' ? 'active' : ''}`}
+                onClick={() => setActiveTab('duplicates')}
+              >
+                🔄 Duplicates
+              </button>
             </div>
 
             {/* Tab content */}
@@ -467,12 +522,37 @@ export default function App() {
               )}
 
               {activeTab === 'explorer' && (
-                <FileTree 
-                  treeData={treeData}
-                  rootPath={lastScannedPath}
-                  selectedPaths={selectedPaths}
-                  togglePathSelection={togglePathSelection}
-                />
+                <div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem', flexWrap: 'wrap', gap: '0.5rem' }}>
+                    <span style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>
+                      {treeData ? `${Object.keys(treeData).length} nodes loaded` : 'No scan data'}
+                    </span>
+                    <div style={{ display: 'flex', gap: '0.5rem' }}>
+                      <button
+                        className="btn"
+                        style={{ fontSize: '0.78rem', padding: '0.35rem 0.6rem' }}
+                        disabled={!treeData}
+                        onClick={() => exportToJson({ tree: treeData, topFiles, scannedAt: new Date().toISOString() }, `disked-scan-${Date.now()}.json`)}
+                      >
+                        Export JSON
+                      </button>
+                      <button
+                        className="btn"
+                        style={{ fontSize: '0.78rem', padding: '0.35rem 0.6rem' }}
+                        disabled={!topFiles?.length}
+                        onClick={() => exportTopFilesToCsv(topFiles, `disked-top-files-${Date.now()}.csv`)}
+                      >
+                        Export CSV
+                      </button>
+                    </div>
+                  </div>
+                  <FileTree
+                    treeData={treeData}
+                    rootPath={lastScannedPath}
+                    selectedPaths={selectedPaths}
+                    togglePathSelection={togglePathSelection}
+                  />
+                </div>
               )}
 
               {activeTab === 'largest' && (
@@ -490,6 +570,14 @@ export default function App() {
               {activeTab === 'uninstall' && (
                 <AppUninstaller onUninstalled={fetchDiskSpace} />
               )}
+
+              {activeTab === 'duplicates' && (
+                <DuplicatesFinder
+                  scanPath={lastScannedPath || scanPath}
+                  selectedPaths={selectedPaths}
+                  togglePathSelection={togglePathSelection}
+                />
+              )}
             </div>
           </div>
         </div>
@@ -500,7 +588,7 @@ export default function App() {
         <div className="deletion-drawer">
           <div className="drawer-left">
             <div className="drawer-title">
-              🧹 Clean-up Queue ({getMinimizedPaths(selectedPaths).length} items)
+              🗑️ Move to Trash Queue ({getMinimizedPaths(selectedPaths).length} items)
             </div>
             <div className="drawer-sub">
               Total Space Reclaimed: <span className="space-to-free">{formatBytes(getSelectionTotalSize())}</span>
@@ -524,7 +612,7 @@ export default function App() {
               onClick={() => setShowConfirmModal(true)}
               disabled={isDeleting}
             >
-              {isDeleting ? 'Deleting...' : 'Delete Selected Paths'}
+              {isDeleting ? 'Moving to Trash...' : 'Move Selected to Trash'}
             </button>
           </div>
         </div>
@@ -535,21 +623,21 @@ export default function App() {
         <div className="modal-overlay">
           <div className="modal-content">
             <div className="modal-header">
-              ⚠️ Confirm Permanent Deletion
+              ⚠️ Confirm Move to Trash
             </div>
             <div className="modal-body">
-              <p>Are you sure you want to permanently delete these <strong>{selectedPaths.size}</strong> selected files/folders?</p>
+              <p>Are you sure you want to move these <strong>{selectedPaths.size}</strong> selected files/folders to the Trash?</p>
               <div className="danger-text-box">
-                <strong>Crucial Warning:</strong> This operation CANNOT be undone. Files will be permanently purged (bypassing the Trash) to immediately recover space.
+                <strong>You can recover them:</strong> Items will be moved to the system Trash. Empty the Trash later to permanently free the space.
               </div>
-              <p>Estimated reclaimed space: <strong>{formatBytes(getSelectionTotalSize())}</strong></p>
+              <p>Estimated space that will be reclaimed after emptying Trash: <strong>{formatBytes(getSelectionTotalSize())}</strong></p>
             </div>
             <div className="modal-footer">
               <button className="btn" onClick={() => setShowConfirmModal(false)}>
                 Cancel
               </button>
               <button className="btn btn-danger" onClick={handleDeleteConfirm}>
-                Yes, Purge Files
+                Yes, Move to Trash
               </button>
             </div>
           </div>
@@ -561,10 +649,10 @@ export default function App() {
         <div className="modal-overlay">
           <div className="modal-content" style={{ maxWidth: '600px' }}>
             <div className="modal-header">
-              ✅ Deletion Report
+              ✅ Moved to Trash
             </div>
             <div className="modal-body" style={{ maxHeight: '400px', overflowY: 'auto' }}>
-              <p>Successfully reclaimed <strong>{formatBytes(deletionSummary.spaceFreed)}</strong> of disk space.</p>
+              <p>Successfully moved <strong>{formatBytes(deletionSummary.spaceFreed)}</strong> to Trash. Empty the Trash to permanently free the space.</p>
               <h4 style={{ marginTop: '1rem', marginBottom: '0.5rem' }}>Detailed Status:</h4>
               <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
                 {deletionSummary.results.map((res, i) => (
@@ -584,7 +672,7 @@ export default function App() {
                       {res.path}
                     </span>
                     <span style={{ fontWeight: 'bold' }}>
-                      {res.status === 'success' ? `Freed ${formatBytes(res.size)}` : res.status === 'simulated' ? `Simulated ${formatBytes(res.size)}` : `Error: ${res.reason}`}
+                      {res.status === 'success' ? `Moved ${formatBytes(res.size)} to Trash` : res.status === 'simulated' ? `Simulated ${formatBytes(res.size)}` : `Error: ${res.reason}`}
                     </span>
                   </div>
                 ))}

@@ -1,5 +1,7 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::Hasher;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::path::{Path, PathBuf};
@@ -69,6 +71,12 @@ pub struct ScanProgress {
     #[serde(rename = "topFiles")]
     pub top_files: Vec<FileNode>,
     pub error: Option<String>,
+    #[serde(rename = "permissionErrors")]
+    pub permission_errors: u32,
+    #[serde(rename = "maxDepth")]
+    pub max_depth: u32,
+    #[serde(rename = "maxChildren")]
+    pub max_children: u32,
 }
 
 pub struct AppState {
@@ -93,8 +101,16 @@ pub struct DiskSpaceInfo {
 pub struct SmartTarget {
     pub id: String,
     pub name: String,
-    pub path: String,
+    pub icon: String,
     pub description: String,
+    pub category: String,
+    pub path: String,
+    pub paths: Vec<String>,
+    pub command: String,
+    pub safety: String,
+    #[serde(rename = "safetyLabel")]
+    pub safety_label: String,
+    pub consequence: String,
     pub size: u64,
     pub exists: bool,
 }
@@ -140,6 +156,8 @@ pub struct ScanResults {
     pub files_count: u32,
     #[serde(rename = "foldersCount")]
     pub folders_count: u32,
+    #[serde(rename = "permissionErrors")]
+    pub permission_errors: u32,
 }
 
 #[derive(Serialize, Clone)]
@@ -162,6 +180,52 @@ pub struct LeftoverItem {
     pub is_app: bool,
     #[serde(rename = "needsAdmin")]
     pub needs_admin: bool,
+}
+
+#[derive(Deserialize)]
+pub struct SmartScanTargetConfig {
+    pub id: String,
+    pub name: String,
+    pub icon: String,
+    pub description: String,
+    pub category: String,
+    pub paths: Vec<String>,
+    pub command: String,
+    pub safety: String,
+    #[serde(rename = "safetyLabel")]
+    pub safety_label: String,
+    pub consequence: String,
+}
+
+#[derive(Deserialize)]
+pub struct SmartScanConfig {
+    pub targets: Vec<SmartScanTargetConfig>,
+}
+
+const SMART_SCAN_CONFIG_JSON: &str = include_str!("../smart-scan-config.json");
+
+#[derive(Serialize, Clone)]
+pub struct DuplicateFile {
+    pub path: String,
+    pub size: u64,
+    #[serde(rename = "updatedAt")]
+    pub updated_at: u64,
+}
+
+#[derive(Serialize)]
+pub struct DuplicateGroup {
+    pub size: u64,
+    pub count: usize,
+    #[serde(rename = "wastedSpace")]
+    pub wasted_space: u64,
+    pub files: Vec<DuplicateFile>,
+}
+
+#[derive(Serialize)]
+pub struct DuplicatesResult {
+    pub groups: Vec<DuplicateGroup>,
+    #[serde(rename = "totalWasted")]
+    pub total_wasted: u64,
 }
 
 #[derive(Serialize)]
@@ -291,6 +355,7 @@ fn scan_directory_recursive(
     cancelled: &Arc<AtomicBool>,
     app_handle: &AppHandle,
     last_emit: &Arc<Mutex<Instant>>,
+    depth: u32,
 ) -> u64 {
     if cancelled.load(Ordering::Relaxed) {
         return 0;
@@ -314,11 +379,18 @@ fn scan_directory_recursive(
         }
     }
 
+    let (max_depth, max_children) = {
+        let progress = state.lock().unwrap();
+        (progress.max_depth, progress.max_children)
+    };
+    let should_recurse = depth < max_depth;
+
     let mut total_size = 0;
     let mut children = Vec::new();
 
-    if let Ok(entries) = fs::read_dir(dir_path) {
-        for entry in entries.flatten() {
+    match fs::read_dir(dir_path) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
             if cancelled.load(Ordering::Relaxed) {
                 return 0;
             }
@@ -338,7 +410,7 @@ fn scan_directory_recursive(
 
                 if file_type.is_dir() {
                     let is_leaf = LEAF_DIRECTORIES.contains(&name.as_str());
-                    let sub_size = if is_leaf {
+                    let sub_size = if is_leaf || !should_recurse {
                         get_folder_size_fast(&path, cancelled)
                     } else {
                         scan_directory_recursive(
@@ -349,6 +421,7 @@ fn scan_directory_recursive(
                             cancelled,
                             app_handle,
                             last_emit,
+                            depth + 1,
                         )
                     };
 
@@ -408,8 +481,20 @@ fn scan_directory_recursive(
             }
         }
     }
+    Err(err) => {
+        if err.kind() == std::io::ErrorKind::PermissionDenied {
+            let mut progress = state.lock().unwrap();
+            progress.permission_errors += 1;
+        }
+    }
+    }
 
     children.sort_by(|a, b| b.size.cmp(&a.size));
+
+    // Bound memory usage by keeping only the largest children per folder
+    if children.len() > max_children as usize {
+        children.truncate(max_children as usize);
+    }
 
     let folder_node = FolderNode {
         name: dir_path.file_name().and_then(|n| n.to_str()).unwrap_or(&dir_path_str).to_string(),
@@ -736,6 +821,105 @@ fn is_safe_to_uninstall(path_str: &str, home_dir: &str) -> bool {
     false
 }
 
+fn hash_file(path: &Path) -> Result<String, std::io::Error> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = DefaultHasher::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hasher.write(&buffer[..n]);
+    }
+    Ok(format!("{:x}", hasher.finish()))
+}
+
+fn find_duplicate_groups(
+    target_path: &Path,
+    home_dir: &str,
+    min_size: u64,
+    cancelled: &Arc<AtomicBool>,
+) -> Result<DuplicatesResult, String> {
+    let mut files_by_size: HashMap<u64, Vec<DuplicateFile>> = HashMap::new();
+
+    for entry in walkdir::WalkDir::new(target_path)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if is_excluded(path, home_dir) {
+            continue;
+        }
+
+        let metadata = match path.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let size = metadata.len();
+        if size < min_size {
+            continue;
+        }
+
+        let updated_at = metadata.modified().ok()
+            .map(get_epoch_millis)
+            .unwrap_or(0);
+
+        files_by_size.entry(size).or_default().push(DuplicateFile {
+            path: path.to_string_lossy().to_string(),
+            size,
+            updated_at,
+        });
+    }
+
+    let mut groups = Vec::new();
+    for candidates in files_by_size.values() {
+        if candidates.len() < 2 {
+            continue;
+        }
+
+        let mut hashes: HashMap<String, Vec<DuplicateFile>> = HashMap::new();
+        for file in candidates {
+            if cancelled.load(Ordering::Relaxed) {
+                break;
+            }
+            match hash_file(Path::new(&file.path)) {
+                Ok(hash) => {
+                    hashes.entry(hash).or_default().push(file.clone());
+                }
+                Err(_) => continue,
+            }
+        }
+
+        for mut group in hashes.into_values() {
+            if group.len() >= 2 {
+                group.sort_by(|a, b| a.path.cmp(&b.path));
+                let wasted = group[0].size * (group.len() as u64 - 1);
+                groups.push(DuplicateGroup {
+                    size: group[0].size,
+                    count: group.len(),
+                    wasted_space: wasted,
+                    files: group,
+                });
+            }
+        }
+    }
+
+    groups.sort_by(|a, b| b.wasted_space.cmp(&a.wasted_space));
+    let total_wasted = groups.iter().map(|g| g.wasted_space).sum();
+
+    Ok(DuplicatesResult { groups, total_wasted })
+}
+
 // ----------------- TAURI COMMANDS -----------------
 
 #[tauri::command]
@@ -823,6 +1007,8 @@ fn get_disk_space(app_handle: AppHandle) -> Result<DiskSpaceInfo, String> {
 #[tauri::command]
 fn start_scan(
     scan_path: String,
+    max_depth: Option<u32>,
+    max_children: Option<u32>,
     state: State<'_, AppState>,
     app_handle: AppHandle,
 ) -> Result<String, String> {
@@ -850,6 +1036,9 @@ fn start_scan(
         progress.total_size_calculated = 0;
         progress.top_files.clear();
         progress.error = None;
+        progress.permission_errors = 0;
+        progress.max_depth = max_depth.unwrap_or(10);
+        progress.max_children = max_children.unwrap_or(200);
     }
 
     {
@@ -876,6 +1065,7 @@ fn start_scan(
             &scan_cancelled,
             &handle_clone,
             &last_emit,
+            0,
         );
 
         let is_cancelled = scan_cancelled.load(Ordering::Relaxed);
@@ -924,6 +1114,7 @@ fn get_scan_results(state: State<'_, AppState>) -> Result<ScanResults, String> {
         total_size: progress.total_size_calculated,
         files_count: progress.files_scanned,
         folders_count: progress.folders_scanned,
+        permission_errors: progress.permission_errors,
     })
 }
 
@@ -971,49 +1162,30 @@ fn delete_paths(paths: Vec<String>, app_handle: AppHandle) -> DeletionSummary {
             }
         };
 
-        let mut size = metadata.len();
         let is_dir = metadata.is_dir();
-
-        if is_dir {
-            size = get_folder_size_fast(p, &cancelled);
-            match fs::remove_dir_all(p) {
-                Ok(_) => {
-                    space_freed += size;
-                    results.push(DeletionItemResult {
-                        path: target_path_str.clone(),
-                        status: "success".to_string(),
-                        size,
-                        reason: "".to_string(),
-                    });
-                }
-                Err(e) => {
-                    results.push(DeletionItemResult {
-                        path: target_path_str.clone(),
-                        status: "error".to_string(),
-                        size: 0,
-                        reason: e.to_string(),
-                    });
-                }
-            }
+        let size = if is_dir {
+            get_folder_size_fast(p, &cancelled)
         } else {
-            match fs::remove_file(p) {
-                Ok(_) => {
-                    space_freed += size;
-                    results.push(DeletionItemResult {
-                        path: target_path_str.clone(),
-                        status: "success".to_string(),
-                        size,
-                        reason: "".to_string(),
-                    });
-                }
-                Err(e) => {
-                    results.push(DeletionItemResult {
-                        path: target_path_str.clone(),
-                        status: "error".to_string(),
-                        size: 0,
-                        reason: e.to_string(),
-                    });
-                }
+            metadata.len()
+        };
+
+        match trash::delete(p) {
+            Ok(_) => {
+                space_freed += size;
+                results.push(DeletionItemResult {
+                    path: target_path_str.clone(),
+                    status: "success".to_string(),
+                    size,
+                    reason: "".to_string(),
+                });
+            }
+            Err(e) => {
+                results.push(DeletionItemResult {
+                    path: target_path_str.clone(),
+                    status: "error".to_string(),
+                    size: 0,
+                    reason: e.to_string(),
+                });
             }
         }
     }
@@ -1158,8 +1330,7 @@ fn uninstall_paths(paths: Vec<String>, app_handle: AppHandle) -> DeletionSummary
         let is_dir = metadata.is_dir();
         let size = if is_dir { get_folder_size_fast(p, &cancelled) } else { metadata.len() };
 
-        let outcome = if is_dir { fs::remove_dir_all(p) } else { fs::remove_file(p) };
-        match outcome {
+        match trash::delete(p) {
             Ok(_) => {
                 space_freed += size;
                 results.push(DeletionItemResult {
@@ -1170,11 +1341,7 @@ fn uninstall_paths(paths: Vec<String>, app_handle: AppHandle) -> DeletionSummary
                 });
             }
             Err(e) => {
-                let reason = if e.kind() == std::io::ErrorKind::PermissionDenied {
-                    "Permission denied — requires admin privileges".to_string()
-                } else {
-                    e.to_string()
-                };
+                let reason = e.to_string();
                 results.push(DeletionItemResult {
                     path: target_path_str.clone(),
                     status: "error".to_string(),
@@ -1230,143 +1397,90 @@ fn reveal_in_explorer(target_path: String) -> Result<(), String> {
     Ok(())
 }
 
+fn resolve_scan_path(raw: &str, home: &Path) -> PathBuf {
+    let expanded = if raw.starts_with("~/") {
+        home.join(&raw[2..])
+    } else {
+        PathBuf::from(raw)
+    };
+
+    #[cfg(target_os = "windows")]
+    {
+        let expanded_str = expanded.to_string_lossy().to_string();
+        let expanded_str = expanded_str.replace("%APPDATA%", &std::env::var("APPDATA").unwrap_or_default());
+        let expanded_str = expanded_str.replace("%LOCALAPPDATA%", &std::env::var("LOCALAPPDATA").unwrap_or_default());
+        return PathBuf::from(expanded_str);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        expanded
+    }
+}
+
 #[tauri::command]
 fn get_smart_scan_targets(app_handle: AppHandle) -> Vec<SmartTarget> {
     let home = app_handle.path().home_dir().unwrap_or_else(|_| PathBuf::from("/"));
-    let mut targets = Vec::new();
-    
-    if cfg!(target_os = "macos") {
-        targets.push(SmartTarget {
-            id: "npm".to_string(),
-            name: "NPM Cache".to_string(),
-            path: home.join(".npm").to_string_lossy().to_string(),
-            description: "NPM package registry local cache".to_string(),
-            size: 0,
-            exists: false,
-        });
-        targets.push(SmartTarget {
-            id: "pip".to_string(),
-            name: "Pip Cache".to_string(),
-            path: home.join("Library/Caches/pip").to_string_lossy().to_string(),
-            description: "Python package download cache".to_string(),
-            size: 0,
-            exists: false,
-        });
-        targets.push(SmartTarget {
-            id: "yarn".to_string(),
-            name: "Yarn Cache".to_string(),
-            path: home.join("Library/Caches/Yarn").to_string_lossy().to_string(),
-            description: "Yarn package caching directory".to_string(),
-            size: 0,
-            exists: false,
-        });
-        targets.push(SmartTarget {
-            id: "cargo".to_string(),
-            name: "Cargo Cache".to_string(),
-            path: home.join(".cargo/registry").to_string_lossy().to_string(),
-            description: "Rust Cargo dependency cache".to_string(),
-            size: 0,
-            exists: false,
-        });
-        targets.push(SmartTarget {
-            id: "xcode".to_string(),
-            name: "Xcode DerivedData".to_string(),
-            path: home.join("Library/Developer/Xcode/DerivedData").to_string_lossy().to_string(),
-            description: "Xcode build outputs and indexes".to_string(),
-            size: 0,
-            exists: false,
-        });
-        targets.push(SmartTarget {
-            id: "caches".to_string(),
-            name: "System Cache".to_string(),
-            path: home.join("Library/Caches").to_string_lossy().to_string(),
-            description: "General applications caches".to_string(),
-            size: 0,
-            exists: false,
-        });
-        targets.push(SmartTarget {
-            id: "logs".to_string(),
-            name: "User Logs".to_string(),
-            path: home.join("Library/Logs").to_string_lossy().to_string(),
-            description: "User applications debug logs".to_string(),
-            size: 0,
-            exists: false,
-        });
-        targets.push(SmartTarget {
-            id: "trash".to_string(),
-            name: "Trash Bin".to_string(),
-            path: home.join(".Trash").to_string_lossy().to_string(),
-            description: "Files moved to trash".to_string(),
-            size: 0,
-            exists: false,
-        });
-    } else if cfg!(target_os = "windows") {
-        let appdata = std::env::var("APPDATA").map(PathBuf::from).unwrap_or_else(|_| home.clone());
-        let localappdata = std::env::var("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|_| home.clone());
-        
-        targets.push(SmartTarget {
-            id: "npm".to_string(),
-            name: "NPM Cache".to_string(),
-            path: appdata.join("npm-cache").to_string_lossy().to_string(),
-            description: "NPM package registry local cache".to_string(),
-            size: 0,
-            exists: false,
-        });
-        targets.push(SmartTarget {
-            id: "pip".to_string(),
-            name: "Pip Cache".to_string(),
-            path: localappdata.join("pip/Cache").to_string_lossy().to_string(),
-            description: "Python package download cache".to_string(),
-            size: 0,
-            exists: false,
-        });
-        targets.push(SmartTarget {
-            id: "cargo".to_string(),
-            name: "Cargo Cache".to_string(),
-            path: home.join(".cargo/registry").to_string_lossy().to_string(),
-            description: "Rust Cargo dependency cache".to_string(),
-            size: 0,
-            exists: false,
-        });
-        targets.push(SmartTarget {
-            id: "caches".to_string(),
-            name: "System Temp".to_string(),
-            path: localappdata.join("Temp").to_string_lossy().to_string(),
-            description: "Windows temporary files".to_string(),
-            size: 0,
-            exists: false,
-        });
-    } else {
-        // Fallback / Linux
-        targets.push(SmartTarget {
-            id: "npm".to_string(),
-            name: "NPM Cache".to_string(),
-            path: home.join(".npm").to_string_lossy().to_string(),
-            description: "NPM package registry local cache".to_string(),
-            size: 0,
-            exists: false,
-        });
-        targets.push(SmartTarget {
-            id: "cargo".to_string(),
-            name: "Cargo Cache".to_string(),
-            path: home.join(".cargo/registry").to_string_lossy().to_string(),
-            description: "Rust Cargo dependency cache".to_string(),
-            size: 0,
-            exists: false,
-        });
-    }
-    
-    // Calculate sizes
+    let config: SmartScanConfig = serde_json::from_str(SMART_SCAN_CONFIG_JSON)
+        .expect("smart-scan-config.json must be valid JSON");
+
     let cancelled = Arc::new(AtomicBool::new(false));
-    for t in &mut targets {
-        let p = Path::new(&t.path);
-        if p.exists() {
-            t.exists = true;
-            t.size = get_folder_size_fast(p, &cancelled);
-        }
+    let mut targets = Vec::new();
+
+    for t in config.targets {
+        let resolved_paths: Vec<PathBuf> = t.paths
+            .iter()
+            .map(|p| resolve_scan_path(p, &home))
+            .filter(|p| p.exists())
+            .collect();
+
+        let exists = !resolved_paths.is_empty();
+        let primary_path = resolved_paths
+            .first()
+            .cloned()
+            .unwrap_or_else(|| resolve_scan_path(&t.paths[0], &home));
+
+        let size = if exists {
+            resolved_paths
+                .iter()
+                .map(|p| get_folder_size_fast(p, &cancelled))
+                .sum()
+        } else {
+            0
+        };
+
+        targets.push(SmartTarget {
+            id: t.id,
+            name: t.name,
+            icon: t.icon,
+            description: t.description,
+            category: t.category,
+            path: primary_path.to_string_lossy().to_string(),
+            paths: resolved_paths.iter().map(|p| p.to_string_lossy().to_string()).collect(),
+            command: t.command,
+            safety: t.safety,
+            safety_label: t.safety_label,
+            consequence: t.consequence,
+            size,
+            exists,
+        });
     }
-    
+
     targets
+}
+
+#[tauri::command]
+fn find_duplicates(scan_path: String, min_size: Option<u64>, app_handle: AppHandle) -> Result<DuplicatesResult, String> {
+    let target = PathBuf::from(&scan_path);
+    if !target.exists() {
+        return Err("Target path does not exist".to_string());
+    }
+
+    let home = app_handle.path().home_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    let home_dir_str = home.to_string_lossy().to_string();
+    let cancelled = Arc::new(AtomicBool::new(false));
+
+    find_duplicate_groups(&target, &home_dir_str, min_size.unwrap_or(1024), &cancelled)
 }
 
 #[tauri::command]
@@ -1482,6 +1596,9 @@ pub fn run() {
                 total_size_calculated: 0,
                 top_files: Vec::new(),
                 error: None,
+                permission_errors: 0,
+                max_depth: 10,
+                max_children: 200,
             })),
             tree: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -1496,9 +1613,73 @@ pub fn run() {
             uninstall_paths,
             reveal_in_explorer,
             get_smart_scan_targets,
+            find_duplicates,
             run_docker_prune,
             run_terminal_command
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_home_with_dirs() -> (std::path::PathBuf, std::path::PathBuf) {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("disked_test_{}", suffix));
+        let home = base.join("home");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(home.join(".npm")).unwrap();
+        fs::create_dir_all(home.join("Documents")).unwrap();
+        fs::create_dir_all(home.join("Downloads")).unwrap();
+        fs::write(home.join("Downloads/old.zip"), b"").unwrap();
+        (base, home)
+    }
+
+    #[test]
+    fn test_is_safe_to_delete_blocks_system_paths() {
+        let (_base, home) = temp_home_with_dirs();
+        assert!(!is_safe_to_delete("/System", home.to_str().unwrap()));
+        assert!(!is_safe_to_delete("/Applications", home.to_str().unwrap()));
+        assert!(!is_safe_to_delete("/Users", home.to_str().unwrap()));
+    }
+
+    #[test]
+    fn test_is_safe_to_delete_allows_home_subfolder() {
+        let (_base, home) = temp_home_with_dirs();
+        assert!(is_safe_to_delete(home.join(".npm").to_str().unwrap(), home.to_str().unwrap()));
+        assert!(is_safe_to_delete(home.join("Downloads/old.zip").to_str().unwrap(), home.to_str().unwrap()));
+    }
+
+    #[test]
+    fn test_is_safe_to_delete_blocks_home_root() {
+        let (_base, home) = temp_home_with_dirs();
+        assert!(!is_safe_to_delete(home.to_str().unwrap(), home.to_str().unwrap()));
+        assert!(!is_safe_to_delete(home.join("Documents").to_str().unwrap(), home.to_str().unwrap()));
+    }
+
+    #[test]
+    fn test_is_excluded_blocks_system_paths() {
+        let (_base, home) = temp_home_with_dirs();
+        assert!(is_excluded(Path::new("/System"), home.to_str().unwrap()));
+        assert!(is_excluded(Path::new("/usr/bin"), home.to_str().unwrap()));
+    }
+
+    #[test]
+    fn test_bundle_tokens_drops_common_tlds() {
+        let tokens = bundle_tokens("com.google.chrome");
+        assert_eq!(tokens, vec!["google", "chrome"]);
+    }
+
+    #[test]
+    fn test_entry_matches_exact_bundle_id() {
+        assert!(entry_matches("com.test.app", "com.test.app", "MyApp", "myapp", "id"));
+        assert!(!entry_matches("com.other.app", "com.test.app", "MyApp", "myapp", "id"));
+    }
 }

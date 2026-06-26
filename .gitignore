@@ -4,3 +4,9 @@ dist/
 src-tauri/target/
 src-tauri/Cargo.lock.bak
 .env
+.env.*
+*.log
+npm-debug.log*
+coverage/
+.vite/
+.cache/

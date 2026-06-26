@@ -21,8 +21,9 @@ export const apiInvoke = async (commandName, args = {}) => {
       'uninstall_paths': { path: '/api/uninstall', method: 'POST' },
       'reveal_in_explorer': { path: '/api/reveal', method: 'POST' },
       'get_smart_scan_targets': { path: '/api/smart-scan-targets', method: 'GET' },
+      'find_duplicates': { path: '/api/duplicates', method: 'POST' },
       'run_docker_prune': { path: '/api/docker-prune', method: 'POST' },
-      'run_terminal_command': { path: '/api/terminal/run', method: 'POST' }
+      // Terminal is desktop-only; do not map to an Express endpoint for security.
     };
 
     const route = mapping[commandName];
@@ -41,10 +42,15 @@ export const apiInvoke = async (commandName, args = {}) => {
       let body = {};
       if (commandName === 'start_scan') {
         body.scanPath = args.scanPath;
+        body.maxDepth = args.maxDepth;
+        body.maxChildren = args.maxChildren;
       } else if (commandName === 'delete_paths' || commandName === 'uninstall_paths') {
         body.paths = args.paths;
       } else if (commandName === 'find_app_leftovers') {
         body.appPath = args.appPath;
+      } else if (commandName === 'find_duplicates') {
+        body.scanPath = args.scanPath;
+        body.minSize = args.minSize;
       } else if (commandName === 'reveal_in_explorer') {
         body.targetPath = args.targetPath;
       } else if (commandName === 'run_terminal_command') {

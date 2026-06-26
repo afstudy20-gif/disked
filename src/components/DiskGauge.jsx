@@ -49,25 +49,54 @@ export default function DiskGauge({ total, used, available, other = 0, percentag
             cy="100" 
             r={radius} 
           />
+          {/* Current disk usage arc */}
+          <circle
+            className={`gauge-indicator ${colorClass}`}
+            cx="100"
+            cy="100"
+            r={radius}
+            strokeDasharray={circumference}
+            strokeDashoffset={baseOffset}
+          />
+          {/* Reclaim preview arc (drawn on top when items are selected) */}
+          {reclaimSize > 0 && cappedReclaimPercent > 0 && (
+            <circle
+              className="gauge-indicator success"
+              cx="100"
+              cy="100"
+              r={radius}
+              strokeDasharray={circumference}
+              strokeDashoffset={reclaimOffset}
+              style={{
+                // Start the reclaim arc where the new (post-reclaim) usage ends
+                transform: `rotate(${(newUsedPercentage / 100) * 360}deg)`,
+                transformOrigin: '100px 100px'
+              }}
+            />
+          )}
         </svg>
         <div className="gauge-text">
           {reclaimSize > 0 ? (
             <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
-              <span className="gauge-free-title">Free Space</span>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '0.2rem', margin: '0.2rem 0' }}>
-                <span className="gauge-free-old">{formatBytes(available)}</span>
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '0.2rem' }}>
-                <span style={{ fontSize: '1rem', color: 'var(--color-success)', fontWeight: 'bold' }}>→</span>
-                <span className="gauge-free-new" style={{ color: 'var(--color-success)', fontWeight: 'bold' }}>
+              <span className="gauge-percent">{newUsedPercentage}%</span>
+              <span className="gauge-label">after clean</span>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.2rem', marginTop: '0.4rem' }}>
+                <span className="gauge-free-old" style={{ fontSize: '0.85rem', textDecoration: 'line-through', color: 'var(--text-muted)' }}>
+                  {formatBytes(available)}
+                </span>
+                <span style={{ fontSize: '0.85rem', color: 'var(--color-success)', fontWeight: 'bold' }}>→</span>
+                <span className="gauge-free-new" style={{ fontSize: '0.85rem', color: 'var(--color-success)', fontWeight: 'bold' }}>
                   {formatBytes(available + reclaimSize)}
                 </span>
               </div>
             </div>
           ) : (
             <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
-              <span className="gauge-free-val">{formatBytes(available)}</span>
-              <span className="gauge-free-label">Free</span>
+              <span className="gauge-percent">{percentage}%</span>
+              <span className="gauge-label">used</span>
+              <span className="gauge-free-val" style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', marginTop: '0.3rem' }}>
+                {formatBytes(available)} free
+              </span>
             </div>
           )}
         </div>

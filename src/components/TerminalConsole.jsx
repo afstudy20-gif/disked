@@ -101,6 +101,19 @@ export default function TerminalConsole() {
     ]);
   };
 
+  if (!isTauri()) {
+    return (
+      <div className="card" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '1rem', minHeight: '300px', textAlign: 'center' }}>
+        <span style={{ fontSize: '2rem' }}>🔒</span>
+        <h3>Terminal is Desktop-Only</h3>
+        <p style={{ color: 'var(--text-secondary)', maxWidth: '400px' }}>
+          For security, the interactive terminal is only available inside the Tauri desktop app.
+          It is disabled in the browser/Express dev mode.
+        </p>
+      </div>
+    );
+  }
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem', height: '100%', minHeight: '480px' }}>
       {/* Quick shortcuts header */}

@@ -2,50 +2,6 @@ import React, { useEffect, useState } from 'react';
 import { apiInvoke } from '../utils/api';
 import { formatBytes } from './DiskGauge';
 
-// Safety guidelines gathered from official documentation and developer consensus
-const targetHints = {
-  npm: {
-    safety: 'safe',
-    safetyLabel: 'Güvenli ✅',
-    consequence: 'NPM paket depolarını bilgisayarınızdan siler. Bir sonraki projenizde "npm install" çalıştırdığınızda paketler internetten tekrar indirileceği için ilk yükleme biraz daha uzun sürer.'
-  },
-  pip: {
-    safety: 'safe',
-    safetyLabel: 'Güvenli ✅',
-    consequence: 'Python paket önbelleklerini temizler. Bir sonraki "pip install" işleminde paketler PyPI üzerinden tekrar indirilir, sisteminize zarar vermez.'
-  },
-  yarn: {
-    safety: 'safe',
-    safetyLabel: 'Güvenli ✅',
-    consequence: 'Yarn paket önbelleklerini temizler. Bir sonraki "yarn install" işleminde paketler internetten indirileceği için ilk yükleme süresi biraz uzar.'
-  },
-  cargo: {
-    safety: 'safe',
-    safetyLabel: 'Güvenli ✅',
-    consequence: 'Rust Cargo registry önbelleğini temizler. Bir sonraki Rust projesi derlemenizde kütüphaneler tekrar indirileceği için ilk derleme biraz daha uzun sürer.'
-  },
-  xcode: {
-    safety: 'safe',
-    safetyLabel: 'Güvenli ✅ (Çözümcü)',
-    consequence: 'Xcode derleme çıktıları ve dizinleme dosyalarını siler. Kodunuz silinmez. Xcode projeyi bir sonraki derlemede sıfırdan derleyeceği için ilk derleme uzun sürer ama Xcode derleme hatalarının %90\'ını çözer.'
-  },
-  caches: {
-    safety: 'caution',
-    safetyLabel: 'Dikkatli Olunmalı ⚠️',
-    consequence: 'Chrome, Spotify vb. uygulamaların yerel önbelleğini siler. Uygulamalar açıldığında bu önbellekleri sıfırdan oluşturur. Sildikten sonra bilgisayarı yeniden başlatmanız önerilir.'
-  },
-  logs: {
-    safety: 'safe',
-    safetyLabel: 'Güvenli ✅',
-    consequence: 'Uygulamaların geçmişte ürettiği hata günlüklerini (log) siler. Sistem çalışmasına olumsuz bir etkisi yoktur, geçmiş hataları incelemenizi zorlaştırır.'
-  },
-  trash: {
-    safety: 'safe',
-    safetyLabel: 'Güvenli ✅',
-    consequence: 'Çöp sepetindeki dosyaları kalıcı olarak silerek anında yer açar. Bu işlem geri alınamaz.'
-  }
-};
-
 export default function SmartScanList({ selectedPaths, togglePathSelection, onRefreshTrigger }) {
   const [targets, setTargets] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -135,10 +91,10 @@ export default function SmartScanList({ selectedPaths, togglePathSelection, onRe
                     {target.id === 'trash' ? '🗑️' : '📁'} {target.name}
                   </span>
                   <span className="smart-target-desc" style={{ textOverflow: 'ellipsis', overflow: 'hidden', whiteSpace: 'nowrap' }}>
-                    {target.exists ? target.description : 'Sistemde bulunamadı veya boş'}
+                    {target.exists ? target.description : 'Not found on this system or empty'}
                   </span>
                   <span onClick={(e) => toggleDetails(target.id, e)} className="details-toggle-btn" style={{ cursor: 'pointer' }}>
-                    ℹ️ {isExpanded ? 'Gizle' : 'Detaylar ve Güvenlik'}
+                    ℹ️ {isExpanded ? 'Hide' : 'Details & Safety'}
                   </span>
                 </div>
                 
@@ -154,18 +110,18 @@ export default function SmartScanList({ selectedPaths, togglePathSelection, onRe
                 </div>
               </div>
 
-              {isExpanded && hint && (
+              {isExpanded && target.safety && (
                 <div className="smart-target-expanded-info" onClick={(e) => e.stopPropagation()}>
                   <div style={{ marginBottom: '0.4rem' }}>
-                    <strong>Güvenlik Derecesi:</strong>{' '}
-                    <span style={{ color: hint.safety === 'safe' ? 'var(--color-success)' : 'var(--color-warning)', fontWeight: '600' }}>
-                      {hint.safetyLabel}
+                    <strong>Safety Level:</strong>{' '}
+                    <span style={{ color: target.safety === 'safe' ? 'var(--color-success)' : 'var(--color-warning)', fontWeight: '600' }}>
+                      {target.safetyLabel}
                     </span>
                   </div>
                   <div>
-                    <strong>Silinince Ne Olur?:</strong>{' '}
+                    <strong>What happens if I delete this?</strong>{' '}
                     <span style={{ color: 'var(--text-secondary)', lineHeight: '1.4' }}>
-                      {hint.consequence}
+                      {target.consequence}
                     </span>
                   </div>
                 </div>

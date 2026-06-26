@@ -6,6 +6,10 @@ import path from 'path';
 import { exec, execFile } from 'child_process';
 import { promisify } from 'util';
 import os from 'os';
+import trash from 'trash';
+import crypto from 'crypto';
+import { createReadStream, readFileSync } from 'fs';
+import { fileURLToPath } from 'url';
 
 // Add common macOS paths to process.env.PATH if they aren't already present
 if (process.platform === 'darwin') {
@@ -23,6 +27,21 @@ const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile); // no shell — safe for untrusted path args
 const app = express();
 const PORT = process.env.PORT || 5005;
+
+// Load shared smart-scan configuration from the single source of truth
+// that is also compiled into the Tauri Rust binary.
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const smartScanConfig = JSON.parse(
+  readFileSync(path.join(__dirname, 'src-tauri', 'smart-scan-config.json'), 'utf8')
+);
+
+function resolveTilde(inputPath) {
+  if (typeof inputPath !== 'string') return inputPath;
+  if (inputPath.startsWith('~/')) {
+    return path.join(os.homedir(), inputPath.slice(2));
+  }
+  return inputPath;
+}
 
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
@@ -68,7 +87,8 @@ let scanState = {
   totalSizeCalculated: 0,
   topFiles: [], // Array of { name, path, size, updatedAt }
   tree: {}, // Map of path -> { name, path, size, isDirectory, children }
-  error: null
+  error: null,
+  permissionErrors: 0 // Folders/files that could not be read
 };
 
 class ConcurrencyLimiter {
@@ -124,9 +144,9 @@ function insertIntoTopFiles(list, file) {
 }
 
 // Check path safety before deletion
-function isSafeToDelete(targetPath) {
+function isSafeToDelete(targetPath, homeDir) {
   const normalized = path.normalize(targetPath);
-  const home = os.homedir();
+  const home = homeDir || os.homedir();
   const resolvedHome = path.resolve(home);
   const resolvedTarget = path.resolve(normalized);
 
@@ -277,12 +297,16 @@ function isExcluded(fullPath, homeDir, targetPath) {
 }
 
 // Recursive size calculator with concurrency limit and tree builder
-async function scanDirectoryRecursive(dirPath, state) {
+async function scanDirectoryRecursive(dirPath, state, depth = 0) {
   if (state.cancelled) return 0;
 
   state.currentPath = dirPath;
   state.foldersScanned++;
-  
+
+  const maxDepth = state.maxDepth ?? 10;
+  const maxChildren = state.maxChildren ?? 200;
+  const shouldRecurse = depth < maxDepth;
+
   let totalSize = 0;
   let children = [];
   const home = os.homedir();
@@ -308,11 +332,12 @@ async function scanDirectoryRecursive(dirPath, state) {
         const isLeaf = LEAF_DIRECTORIES.has(entry.name);
         
         let subSize = 0;
-        if (isLeaf) {
-          // If it's a leaf folder (like node_modules), calculate its size but don't add children
+        if (isLeaf || !shouldRecurse) {
+          // If it's a leaf folder (like node_modules) or we've hit the depth limit,
+          // calculate its size but don't add its children to the tree.
           subSize = await getFolderSizeFast(fullPath, state);
         } else {
-          subSize = await scanDirectoryRecursive(fullPath, state);
+          subSize = await scanDirectoryRecursive(fullPath, state, depth + 1);
         }
 
         let mtime = new Date();
@@ -370,10 +395,18 @@ async function scanDirectoryRecursive(dirPath, state) {
     }
   } catch (err) {
     // Permission denied or other error
+    if (err && (err.code === 'EACCES' || err.code === 'EPERM')) {
+      state.permissionErrors++;
+    }
   }
 
   // Sort subfolders/files in tree node by size descending
   children.sort((a, b) => b.size - a.size);
+
+  // Keep only the largest children to bound memory usage
+  if (children.length > maxChildren) {
+    children = children.slice(0, maxChildren);
+  }
 
   state.tree[dirPath] = {
     name: path.basename(dirPath) || dirPath,
@@ -460,7 +493,7 @@ app.get('/api/disk-space', async (req, res) => {
 
 // Endpoint to trigger a scan
 app.post('/api/scan', async (req, res) => {
-  const { scanPath } = req.body;
+  const { scanPath, maxDepth = 10, maxChildren = 200 } = req.body;
   const targetPath = scanPath ? path.resolve(scanPath) : os.homedir();
 
   if (!existsSync(targetPath)) {
@@ -484,11 +517,14 @@ app.post('/api/scan', async (req, res) => {
     totalSizeCalculated: 0,
     topFiles: [],
     tree: {},
-    error: null
+    error: null,
+    permissionErrors: 0,
+    maxDepth,
+    maxChildren
   };
 
   // Run in background
-  scanDirectoryRecursive(targetPath, scanState).then(() => {
+  scanDirectoryRecursive(targetPath, scanState, 0).then(() => {
     scanState.active = false;
   }).catch((err) => {
     scanState.active = false;
@@ -524,7 +560,8 @@ app.get('/api/scan-progress', (req, res) => {
       filesScanned: scanState.filesScanned,
       totalSizeCalculated: scanState.totalSizeCalculated,
       topFiles: scanState.topFiles,
-      error: scanState.error
+      error: scanState.error,
+      permissionErrors: scanState.permissionErrors
     })}\n\n`);
   };
 
@@ -553,7 +590,8 @@ app.get('/api/scan-results', (req, res) => {
     topFiles: scanState.topFiles,
     totalSize: scanState.totalSizeCalculated,
     filesCount: scanState.filesScanned,
-    foldersCount: scanState.foldersScanned
+    foldersCount: scanState.foldersScanned,
+    permissionErrors: scanState.permissionErrors
   });
 });
 
@@ -589,10 +627,10 @@ app.post('/api/delete', async (req, res) => {
       if (stats.isDirectory()) {
         const tempState = { cancelled: false };
         itemSize = await getFolderSizeFast(resolvedPath, tempState);
-        await fs.rm(resolvedPath, { recursive: true, force: true });
-      } else {
-        await fs.unlink(resolvedPath);
       }
+
+      // Move to trash instead of permanently deleting
+      await trash(resolvedPath);
 
       spaceFreed += itemSize;
       results.push({ path: targetPath, status: 'success', size: itemSize });
@@ -610,28 +648,35 @@ app.post('/api/delete', async (req, res) => {
 
 // Smart Clean quick scan categories size scanner
 app.get('/api/smart-scan-targets', async (req, res) => {
-  const home = os.homedir();
-  
-  const targets = [
-    { id: 'npm', name: 'NPM Cache', path: path.join(home, '.npm'), description: 'NPM package registry local cache' },
-    { id: 'pip', name: 'Pip Cache', path: path.join(home, 'Library/Caches/pip'), description: 'Python package download cache' },
-    { id: 'yarn', name: 'Yarn Cache', path: path.join(home, 'Library/Caches/Yarn'), description: 'Yarn package caching directory' },
-    { id: 'cargo', name: 'Cargo Cache', path: path.join(home, '.cargo/registry'), description: 'Rust Cargo dependency cache' },
-    { id: 'xcode', name: 'Xcode DerivedData', path: path.join(home, 'Library/Developer/Xcode/DerivedData'), description: 'Xcode build outputs and indexes' },
-    { id: 'caches', name: 'System Cache', path: path.join(home, 'Library/Caches'), description: 'General applications caches' },
-    { id: 'logs', name: 'User Logs', path: path.join(home, 'Library/Logs'), description: 'User applications debug logs' },
-    { id: 'trash', name: 'Trash Bin', path: path.join(home, '.Trash'), description: 'Files moved to trash' }
-  ];
-
   const results = [];
-  for (const t of targets) {
-    if (existsSync(t.path)) {
+
+  for (const t of smartScanConfig.targets) {
+    const resolvedPaths = t.paths.map(resolveTilde).filter(p => existsSync(p));
+    const exists = resolvedPaths.length > 0;
+    let size = 0;
+
+    if (exists) {
       const tempState = { cancelled: false };
-      const size = await getFolderSizeFast(t.path, tempState);
-      results.push({ ...t, size, exists: true });
-    } else {
-      results.push({ ...t, size: 0, exists: false });
+      for (const p of resolvedPaths) {
+        size += await getFolderSizeFast(p, tempState);
+      }
     }
+
+    results.push({
+      id: t.id,
+      name: t.name,
+      icon: t.icon,
+      description: t.description,
+      category: t.category,
+      path: resolvedPaths[0] || resolveTilde(t.paths[0]),
+      paths: resolvedPaths,
+      command: t.command,
+      safety: t.safety,
+      safetyLabel: t.safetyLabel,
+      consequence: t.consequence,
+      size,
+      exists
+    });
   }
 
   res.json(results);
@@ -649,52 +694,15 @@ app.post('/api/docker-prune', async (req, res) => {
   }
 });
 
-// Run interactive terminal command
-app.post('/api/terminal/run', async (req, res) => {
-  const { command, cwd } = req.body;
-  
-  if (!command) {
-    return res.status(400).json({ error: 'Command is required' });
-  }
-
-  let currentCwd = cwd ? path.resolve(cwd) : os.homedir();
-
-  // Basic cd implementation to maintain directory state
-  const trimmed = command.trim();
-  if (trimmed.startsWith('cd ') || trimmed === 'cd') {
-    let targetDir = os.homedir();
-    if (trimmed.startsWith('cd ')) {
-      targetDir = trimmed.substring(3).trim();
-    }
-    
-    // Resolve relative path
-    const resolvedPath = path.resolve(currentCwd, targetDir);
-    if (existsSync(resolvedPath)) {
-      try {
-        const stats = await fs.lstat(resolvedPath);
-        if (stats.isDirectory()) {
-          return res.json({ stdout: '', stderr: '', cwd: resolvedPath });
-        } else {
-          return res.json({ stdout: '', stderr: `cd: not a directory: ${targetDir}`, cwd: currentCwd });
-        }
-      } catch (e) {
-        return res.json({ stdout: '', stderr: `cd: permission denied: ${targetDir}`, cwd: currentCwd });
-      }
-    } else {
-      return res.json({ stdout: '', stderr: `cd: no such file or directory: ${targetDir}`, cwd: currentCwd });
-    }
-  }
-
-  try {
-    const { stdout, stderr } = await execAsync(command, { cwd: currentCwd, timeout: 30000 });
-    res.json({ stdout, stderr, cwd: currentCwd });
-  } catch (err) {
-    res.json({
-      stdout: err.stdout || '',
-      stderr: err.stderr || err.message,
-      cwd: currentCwd
-    });
-  }
+// Terminal access is intentionally disabled in the Express/web dev server because
+// exposing an arbitrary shell execution endpoint on localhost is a remote-code-
+// execution risk (any website can POST to localhost). Use the Tauri desktop app
+// for the interactive terminal.
+app.post('/api/terminal/run', (req, res) => {
+  res.status(403).json({
+    error: 'Terminal is only available in the Tauri desktop build.',
+    detail: 'Arbitrary shell execution is disabled in the web/Express dev server for security.'
+  });
 });
 
 // ----------------- APP UNINSTALLER (macOS) -----------------
@@ -995,6 +1003,95 @@ app.post('/api/reveal', async (req, res) => {
   }
 });
 
+// Helper: stream a file through SHA-256
+function hashFile(filePath) {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash('sha256');
+    const stream = createReadStream(filePath);
+    stream.on('error', reject);
+    stream.on('data', (chunk) => hash.update(chunk));
+    stream.on('end', () => resolve(hash.digest('hex')));
+  });
+}
+
+// Find duplicate files inside a directory.
+// Groups by size first, then confirms duplicates with SHA-256.
+app.post('/api/duplicates', async (req, res) => {
+  const { scanPath, minSize = 1024 } = req.body;
+  const targetPath = scanPath ? path.resolve(scanPath) : os.homedir();
+
+  if (!existsSync(targetPath)) {
+    return res.status(400).json({ error: 'Target path does not exist' });
+  }
+
+  const filesBySize = new Map(); // size -> [{path, size, mtime}]
+  const home = os.homedir();
+
+  async function collectFiles(dir) {
+    if (isExcluded(dir, home, targetPath)) return;
+    let entries;
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch (err) {
+      return;
+    }
+
+    for (const entry of entries) {
+      if (scanState.cancelled) return;
+      const fullPath = path.join(dir, entry.name);
+      if (isExcluded(fullPath, home, targetPath) || entry.isSymbolicLink()) continue;
+
+      if (entry.isDirectory()) {
+        await collectFiles(fullPath);
+      } else if (entry.isFile()) {
+        try {
+          const stats = await fs.lstat(fullPath);
+          if (stats.size < minSize) continue;
+          const list = filesBySize.get(stats.size) || [];
+          list.push({ path: fullPath, size: stats.size, updatedAt: stats.mtime });
+          filesBySize.set(stats.size, list);
+        } catch (e) {}
+      }
+    }
+  }
+
+  try {
+    await collectFiles(targetPath);
+
+    const duplicateGroups = [];
+    for (const [, candidates] of filesBySize) {
+      if (candidates.length < 2) continue;
+
+      const hashes = new Map(); // hash -> [file objects]
+      for (const file of candidates) {
+        try {
+          const h = await hashFile(file.path);
+          const list = hashes.get(h) || [];
+          list.push(file);
+          hashes.set(h, list);
+        } catch (e) {}
+      }
+
+      for (const group of hashes.values()) {
+        if (group.length >= 2) {
+          group.sort((a, b) => a.path.localeCompare(b.path));
+          duplicateGroups.push({
+            size: group[0].size,
+            count: group.length,
+            wastedSpace: group[0].size * (group.length - 1),
+            files: group
+          });
+        }
+      }
+    }
+
+    duplicateGroups.sort((a, b) => b.wastedSpace - a.wastedSpace);
+    res.json({ groups: duplicateGroups, totalWasted: duplicateGroups.reduce((s, g) => s + g.wastedSpace, 0) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Serve static frontend files in production
 const distPath = path.resolve('dist');
 if (existsSync(distPath)) {
@@ -1007,7 +1104,13 @@ if (existsSync(distPath)) {
   });
 }
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`Backend server is running on http://localhost:${PORT}`);
-});
+// Start server only when this module is run directly (not imported for tests)
+let server = null;
+if (import.meta.url === `file://${process.argv[1]}`) {
+  server = app.listen(PORT, () => {
+    console.log(`Backend server is running on http://localhost:${PORT}`);
+  });
+}
+
+// Export helpers for unit testing
+export { isSafeToDelete, isExcluded, app, server };

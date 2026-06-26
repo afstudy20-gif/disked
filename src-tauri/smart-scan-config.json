@@ -1,0 +1,100 @@
+{
+  "targets": [
+    {
+      "id": "npm",
+      "name": "NPM Cache",
+      "icon": "📦",
+      "description": "Node.js package caches (node_modules caches)",
+      "category": "Package Managers",
+      "paths": ["~/.npm"],
+      "command": "npm cache clean --force",
+      "safety": "safe",
+      "safetyLabel": "Safe ✅",
+      "consequence": "Removes the local NPM package cache. The next time you run \"npm install\" in a project, packages will be re-downloaded from the internet, so the first install may take a bit longer."
+    },
+    {
+      "id": "pip",
+      "name": "Pip Cache",
+      "icon": "🐍",
+      "description": "Python package caches",
+      "category": "Package Managers",
+      "paths": ["~/.cache/pip"],
+      "command": "pip cache purge",
+      "safety": "safe",
+      "safetyLabel": "Safe ✅",
+      "consequence": "Clears Python package caches. Packages will be re-downloaded from PyPI on the next \"pip install\". This does not harm your system."
+    },
+    {
+      "id": "yarn",
+      "name": "Yarn Cache",
+      "icon": "🧶",
+      "description": "Yarn package caches",
+      "category": "Package Managers",
+      "paths": ["~/Library/Caches/Yarn", "~/.cache/yarn"],
+      "command": "yarn cache clean --all",
+      "safety": "safe",
+      "safetyLabel": "Safe ✅",
+      "consequence": "Clears Yarn package caches. The next \"yarn install\" will re-download packages from the internet, so the first install may take slightly longer."
+    },
+    {
+      "id": "cargo",
+      "name": "Cargo Registry",
+      "icon": "🦀",
+      "description": "Rust package registry and build caches",
+      "category": "Package Managers",
+      "paths": ["~/.cargo/registry", "~/.cargo/git"],
+      "command": "cargo cache --autoclean",
+      "safety": "safe",
+      "safetyLabel": "Safe ✅",
+      "consequence": "Clears the Rust Cargo registry cache. Libraries will be re-downloaded on the next Rust project build, so the first compile may take a bit longer."
+    },
+    {
+      "id": "xcode",
+      "name": "Xcode Derived Data",
+      "icon": "🔨",
+      "description": "Xcode build outputs and index data",
+      "category": "Developer Tools",
+      "paths": ["~/Library/Developer/Xcode/DerivedData", "~/Library/Developer/Xcode/Archives"],
+      "command": "rm -rf ~/Library/Developer/Xcode/DerivedData",
+      "safety": "safe",
+      "safetyLabel": "Safe ✅ (Troubleshooter)",
+      "consequence": "Deletes Xcode build outputs and indexing data. Your source code is not deleted. The next build will compile from scratch, which takes longer, but this fixes many Xcode build issues."
+    },
+    {
+      "id": "caches",
+      "name": "Application Caches",
+      "icon": "⚡",
+      "description": "User application caches (Chrome, Spotify, etc.)",
+      "category": "System",
+      "paths": ["~/Library/Caches"],
+      "command": "",
+      "safety": "caution",
+      "safetyLabel": "Use Caution ⚠️",
+      "consequence": "Deletes local caches for apps like Chrome and Spotify. Apps will rebuild these caches on launch. It is recommended to restart your computer after cleaning them."
+    },
+    {
+      "id": "logs",
+      "name": "Application Logs",
+      "icon": "📋",
+      "description": "User application log files",
+      "category": "System",
+      "paths": ["~/Library/Logs"],
+      "command": "",
+      "safety": "safe",
+      "safetyLabel": "Safe ✅",
+      "consequence": "Deletes historical application log files. This does not affect system operation, but you will lose past logs that could be used for troubleshooting."
+    },
+    {
+      "id": "trash",
+      "name": "Trash",
+      "icon": "🗑️",
+      "description": "Files in the system Trash",
+      "category": "System",
+      "paths": ["~/.Trash"],
+      "command": "",
+      "safety": "safe",
+      "safetyLabel": "Safe ✅",
+      "consequence": "Permanently deletes files in the Trash to free space immediately. This action cannot be undone."
+    }
+  ]
+}
