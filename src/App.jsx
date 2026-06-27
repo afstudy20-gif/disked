@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { apiInvoke, apiListen, isTauri } from './utils/api';
 import DiskGauge, { formatBytes } from './components/DiskGauge';
+import DisksOverview from './components/DisksOverview';
 import SmartScanList from './components/SmartScanList';
 import FileTree from './components/FileTree';
 import LargestFiles from './components/LargestFiles';
@@ -378,7 +379,7 @@ export default function App() {
       <div className="dashboard-grid">
         {/* Left Column: Stats and Scanner Controls */}
         <div className="left-column">
-          <DiskGauge 
+          <DiskGauge
             total={diskSpace.total}
             used={diskSpace.used}
             available={diskSpace.available}
@@ -386,6 +387,8 @@ export default function App() {
             percentage={diskSpace.percentage}
             reclaimSize={getSelectionTotalSize()}
           />
+
+          <DisksOverview />
 
           {/* Scanner Controls Card */}
           <div className="card scanner-controls">

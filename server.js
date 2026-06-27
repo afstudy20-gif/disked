@@ -458,6 +458,172 @@ async function getFolderSizeFast(dirPath, state) {
   return size;
 }
 
+// Read disk usage for a given mount point. Returns [total, used] bytes.
+async function dfUsed(mount) {
+  try {
+    const { stdout } = await execFileAsync('df', ['-k', mount]);
+    const line = stdout.trim().split('\n')[1];
+    if (!line) return null;
+    const parts = line.split(/\s+/);
+    if (parts.length < 4) return null;
+    const total = parseInt(parts[1], 10) * 1024;
+    const used = parseInt(parts[2], 10) * 1024;
+    if (Number.isNaN(total) || Number.isNaN(used)) return null;
+    return [total, used];
+  } catch (e) {
+    return null;
+  }
+}
+
+async function plistToJson(buffer) {
+  return new Promise((resolve, reject) => {
+    const p = exec('plutil -convert json -o - -', (err, stdout) => err ? reject(err) : resolve(stdout));
+    p.stdin.write(buffer);
+    p.stdin.end();
+  });
+}
+
+async function collectDisksMacos() {
+  const list = await execFileAsync('diskutil', ['list', '-plist']);
+  const v = JSON.parse(await plistToJson(list.stdout));
+  const all = v.AllDisksAndPartitions || [];
+  const physicalIds = v.WholeDisks || [];
+  const skipNames = new Set(['Preboot', 'Recovery', 'Update', 'VM', 'xART', 'Hardware', 'iSCPreboot']);
+
+  // APFS container map: containerId -> { size, free }
+  const containerInfo = {};
+  try {
+    const apfs = await execFileAsync('diskutil', ['apfs', 'list', '-plist']);
+    const aj = JSON.parse(await plistToJson(apfs.stdout));
+    for (const c of (aj.Containers || [])) {
+      const id = c.ContainerReference;
+      if (!id) continue;
+      containerInfo[id] = { size: c.CapacityCeiling || 0, free: c.CapacityFree || 0 };
+    }
+  } catch (e) {}
+
+  const disks = [];
+
+  for (const physId of physicalIds) {
+    const entry = all.find((e) => e.DeviceIdentifier === physId);
+    if (!entry) continue;
+    // Skip synthesized APFS containers — only show real physical media.
+    if (entry.Content === 'Apple_APFS_Container') continue;
+    const total = entry.Size || 0;
+    let model = physId;
+    try {
+      const info = await execFileAsync('diskutil', ['info', '-plist', physId]);
+      const ij = JSON.parse(await plistToJson(info.stdout));
+      if (ij.MediaName) model = ij.MediaName;
+    } catch (e) {}
+
+    const partitions = [];
+    let allocated = 0;
+    for (const p of (entry.Partitions || [])) {
+      const size = p.Size || 0;
+      allocated += size;
+      const container = all.find((e) =>
+        Array.isArray(e.APFSPhysicalStores) &&
+        e.APFSPhysicalStores.some((s) => s.DeviceIdentifier === p.DeviceIdentifier)
+      );
+      if (container) {
+        // Only surface containers that hold user-visible mounted volumes.
+        const visible = (container.APFSVolumes || []).filter((vol) => {
+          const n = vol.VolumeName || '';
+          const m = vol.MountPoint || '';
+          return m && !m.startsWith('/System/Volumes/') && !skipNames.has(n);
+        });
+        if (visible.length === 0) {
+          partitions.push({
+            name: p.Content || 'System', mount: '', fsType: 'APFS',
+            total: size, used: 0, allocated: true
+          });
+          continue;
+        }
+        const ci = containerInfo[container.DeviceIdentifier] || { size, free: 0 };
+        const containerSize = ci.size || size;
+        const containerUsed = Math.max(0, containerSize - (ci.free || 0));
+        const name = visible[0].VolumeName || 'Macintosh HD';
+        const mount = visible[0].MountPoint || '/';
+        partitions.push({
+          name, mount, fsType: 'APFS',
+          total: containerSize, used: containerUsed, allocated: true
+        });
+        continue;
+      }
+      partitions.push({
+        name: p.Content || 'Partition',
+        mount: '',
+        fsType: p.Content || '',
+        total: size,
+        used: 0,
+        allocated: true
+      });
+    }
+
+    if (total > allocated && total - allocated > 16 * 1024 * 1024) {
+      partitions.push({ name: 'Unallocated', mount: '', fsType: '', total: total - allocated, used: 0, allocated: false });
+    }
+
+    const usedTotal = partitions.filter((p) => p.allocated).reduce((s, p) => s + p.used, 0);
+    const percentage = total > 0 ? Math.round((usedTotal / total) * 100) : 0;
+    disks.push({ name: physId, model, total, percentage, partitions });
+  }
+  return disks;
+}
+
+async function collectDisksLinux() {
+  const { stdout } = await execFileAsync('lsblk', ['-J', '-b', '-o', 'NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,MODEL']);
+  const v = JSON.parse(stdout);
+  const disks = [];
+  for (const b of (v.blockdevices || [])) {
+    if (b.type !== 'disk') continue;
+    const total = parseInt(b.size, 10) || 0;
+    const partitions = [];
+    let allocated = 0;
+    for (const c of (b.children || [])) {
+      const psize = parseInt(c.size, 10) || 0;
+      allocated += psize;
+      const mount = c.mountpoint || '';
+      const fs = c.fstype || '';
+      let ptotal = psize, used = 0;
+      if (mount) {
+        const dfRes = await dfUsed(mount);
+        if (dfRes) [ptotal, used] = dfRes;
+      }
+      partitions.push({
+        name: mount ? `${mount} (${fs})` : c.name,
+        mount, fsType: fs, total: ptotal, used, allocated: true
+      });
+    }
+    if (total > allocated && total - allocated > 16 * 1024 * 1024) {
+      partitions.push({ name: 'Unallocated', mount: '', fsType: '', total: total - allocated, used: 0, allocated: false });
+    }
+    const usedTotal = partitions.filter((p) => p.allocated).reduce((s, p) => s + p.used, 0);
+    const percentage = total > 0 ? Math.round((usedTotal / total) * 100) : 0;
+    disks.push({
+      name: `Disk ${b.name}`,
+      model: (b.model || 'Disk').trim(),
+      total, percentage, partitions
+    });
+  }
+  return disks;
+}
+
+app.get('/api/disks-overview', async (req, res) => {
+  try {
+    let disks = [];
+    if (process.platform === 'darwin') {
+      disks = await collectDisksMacos();
+    } else if (process.platform === 'linux') {
+      disks = await collectDisksLinux();
+    }
+    res.json(disks);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Endpoint to get disk stats
 app.get('/api/disk-space', async (req, res) => {
   try {

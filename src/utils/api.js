@@ -12,6 +12,7 @@ export const apiInvoke = async (commandName, args = {}) => {
     // Map Tauri command names to Express REST API endpoints
     const mapping = {
       'get_disk_space': { path: '/api/disk-space', method: 'GET' },
+      'get_disks_overview': { path: '/api/disks-overview', method: 'GET' },
       'start_scan': { path: '/api/scan', method: 'POST' },
       'cancel_scan': { path: '/api/scan/cancel', method: 'POST' },
       'get_scan_results': { path: '/api/scan-results', method: 'GET' },

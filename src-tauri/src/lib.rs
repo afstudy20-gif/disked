@@ -97,6 +97,26 @@ pub struct DiskSpaceInfo {
     pub home_dir: String,
 }
 
+#[derive(Serialize, Clone)]
+pub struct PartitionInfo {
+    pub name: String,
+    pub mount: String,
+    #[serde(rename = "fsType")]
+    pub fs_type: String,
+    pub total: u64,
+    pub used: u64,
+    pub allocated: bool,
+}
+
+#[derive(Serialize, Clone)]
+pub struct PhysicalDisk {
+    pub name: String,
+    pub model: String,
+    pub total: u64,
+    pub percentage: u32,
+    pub partitions: Vec<PartitionInfo>,
+}
+
 #[derive(Serialize)]
 pub struct SmartTarget {
     pub id: String,
@@ -1004,6 +1024,309 @@ fn get_disk_space(app_handle: AppHandle) -> Result<DiskSpaceInfo, String> {
     }
 }
 
+// Read disk usage for a given mount point via `df -k`. Returns (total, used) bytes.
+#[allow(dead_code)]
+fn df_used(mount: &str) -> Option<(u64, u64)> {
+    let out = prepare_command("df").args(["-k", mount]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout.lines().nth(1)?;
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 4 {
+        return None;
+    }
+    let total_kb: u64 = parts[1].parse().ok()?;
+    let used_kb: u64 = parts[2].parse().ok()?;
+    Some((total_kb * 1024, used_kb * 1024))
+}
+
+#[cfg(target_os = "macos")]
+fn plist_to_json(buf: &[u8]) -> Result<serde_json::Value, String> {
+    use std::io::Write;
+    let mut child = prepare_command("plutil")
+        .args(["-convert", "json", "-o", "-", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn().map_err(|e| e.to_string())?;
+    child.stdin.as_mut().ok_or("stdin")?.write_all(buf).map_err(|e| e.to_string())?;
+    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn collect_disks_macos() -> Result<Vec<PhysicalDisk>, String> {
+    let out = prepare_command("diskutil").args(["list", "-plist"]).output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err("diskutil failed".to_string());
+    }
+    let v = plist_to_json(&out.stdout)?;
+
+    // Build APFS container -> (size, free) map via `diskutil apfs list -plist`.
+    let mut container_info: std::collections::HashMap<String, (u64, u64)> = std::collections::HashMap::new();
+    if let Ok(apfs_out) = prepare_command("diskutil").args(["apfs", "list", "-plist"]).output() {
+        if let Ok(aj) = plist_to_json(&apfs_out.stdout) {
+            if let Some(containers) = aj.get("Containers").and_then(|c| c.as_array()) {
+                for c in containers {
+                    let id = c.get("ContainerReference").and_then(|s| s.as_str()).unwrap_or("");
+                    if id.is_empty() { continue; }
+                    let size = c.get("CapacityCeiling").and_then(|s| s.as_u64()).unwrap_or(0);
+                    let free = c.get("CapacityFree").and_then(|s| s.as_u64()).unwrap_or(0);
+                    container_info.insert(id.to_string(), (size, free));
+                }
+            }
+        }
+    }
+
+    let mut disks: Vec<PhysicalDisk> = Vec::new();
+    let physical_ids: Vec<String> = v.get("WholeDisks").and_then(|w| w.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+
+    let all = v.get("AllDisksAndPartitions").and_then(|a| a.as_array()).cloned().unwrap_or_default();
+
+    // Build map of container ref -> parent physical disk
+    // disk1/2/3 are APFS containers, their parent stored in `APFSPhysicalStores`
+    let mut container_parent: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for entry in &all {
+        let id = entry.get("DeviceIdentifier").and_then(|s| s.as_str()).unwrap_or("");
+        if let Some(stores) = entry.get("APFSPhysicalStores").and_then(|s| s.as_array()) {
+            if let Some(parent) = stores.first().and_then(|s| s.get("DeviceIdentifier")).and_then(|s| s.as_str()) {
+                // parent like "disk0s2" → physical disk0
+                let phys = parent.trim_start_matches("disk")
+                    .chars().take_while(|c| c.is_ascii_digit()).collect::<String>();
+                container_parent.insert(id.to_string(), format!("disk{}", phys));
+            }
+        }
+    }
+
+    for phys_id in &physical_ids {
+        let model = prepare_command("diskutil").args(["info", "-plist", phys_id]).output().ok()
+            .and_then(|o| plist_to_json(&o.stdout).ok())
+            .and_then(|j| j.get("MediaName").and_then(|m| m.as_str()).map(String::from))
+            .unwrap_or_else(|| phys_id.clone());
+
+        // Find the AllDisksAndPartitions entry for this physical disk
+        let entry = all.iter().find(|e|
+            e.get("DeviceIdentifier").and_then(|s| s.as_str()) == Some(phys_id.as_str())
+        );
+        // Skip synthesized APFS containers — only show real physical media.
+        if entry.and_then(|e| e.get("Content").and_then(|c| c.as_str())) == Some("Apple_APFS_Container") {
+            continue;
+        }
+        let total = entry.and_then(|e| e.get("Size").and_then(|s| s.as_u64())).unwrap_or(0);
+
+        let mut partitions: Vec<PartitionInfo> = Vec::new();
+        let mut allocated_size: u64 = 0;
+
+        if let Some(parts) = entry.and_then(|e| e.get("Partitions").and_then(|p| p.as_array())) {
+            for p in parts {
+                let id = p.get("DeviceIdentifier").and_then(|s| s.as_str()).unwrap_or("");
+                let size = p.get("Size").and_then(|s| s.as_u64()).unwrap_or(0);
+                let content = p.get("Content").and_then(|s| s.as_str()).unwrap_or("");
+                allocated_size += size;
+
+                // If this partition references an APFS container, expand its mounted user volumes
+                let container = all.iter().find(|e|
+                    e.get("APFSPhysicalStores").and_then(|s| s.as_array())
+                        .map(|a| a.iter().any(|x| x.get("DeviceIdentifier").and_then(|d| d.as_str()) == Some(id)))
+                        .unwrap_or(false)
+                );
+                if let Some(c) = container {
+                    let cid = c.get("DeviceIdentifier").and_then(|s| s.as_str()).unwrap_or("");
+                    let skip_names = ["Preboot", "Recovery", "Update", "VM", "xART", "Hardware", "iSCPreboot"];
+                    let (mut friendly_name, mut friendly_mount) = (String::new(), String::new());
+                    if let Some(vols) = c.get("APFSVolumes").and_then(|v| v.as_array()) {
+                        for vol in vols {
+                            let name = vol.get("VolumeName").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                            let mount = vol.get("MountPoint").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                            if mount.is_empty() || mount.starts_with("/System/Volumes/") { continue; }
+                            if skip_names.contains(&name.as_str()) { continue; }
+                            friendly_name = if name.is_empty() { mount.clone() } else { name };
+                            friendly_mount = mount;
+                            break;
+                        }
+                    }
+
+                    // Container with no user-visible volumes → show as inert system slice.
+                    if friendly_name.is_empty() {
+                        partitions.push(PartitionInfo {
+                            name: if content.is_empty() { "System".to_string() } else { content.to_string() },
+                            mount: String::new(),
+                            fs_type: "APFS".to_string(),
+                            total: size,
+                            used: 0,
+                            allocated: true,
+                        });
+                        continue;
+                    }
+
+                    let (container_size, container_used) = container_info.get(cid)
+                        .map(|(sz, free)| (*sz, sz.saturating_sub(*free)))
+                        .unwrap_or((size, 0));
+
+                    partitions.push(PartitionInfo {
+                        name: friendly_name,
+                        mount: friendly_mount,
+                        fs_type: "APFS".to_string(),
+                        total: container_size,
+                        used: container_used,
+                        allocated: true,
+                    });
+                    continue;
+                }
+
+                // Non-APFS or unmounted slice — show as raw partition
+                partitions.push(PartitionInfo {
+                    name: content.to_string(),
+                    mount: String::new(),
+                    fs_type: content.to_string(),
+                    total: size,
+                    used: 0,
+                    allocated: true,
+                });
+            }
+        }
+
+        // Add unallocated trailing space if any
+        if total > allocated_size && total - allocated_size > 16 * 1024 * 1024 {
+            partitions.push(PartitionInfo {
+                name: "Unallocated".to_string(),
+                mount: String::new(),
+                fs_type: String::new(),
+                total: total - allocated_size,
+                used: 0,
+                allocated: false,
+            });
+        }
+
+        let total_used: u64 = partitions.iter().filter(|p| p.allocated).map(|p| p.used).sum();
+        let percentage = if total > 0 { ((total_used as f64 / total as f64) * 100.0) as u32 } else { 0 };
+
+        disks.push(PhysicalDisk { name: phys_id.clone(), model, total, percentage, partitions });
+    }
+
+    Ok(disks)
+}
+
+#[cfg(target_os = "windows")]
+fn collect_disks_windows() -> Result<Vec<PhysicalDisk>, String> {
+    // PowerShell: list disks with their partitions and volumes as JSON.
+    let script = r#"
+$ErrorActionPreference='SilentlyContinue'
+$disks = Get-Disk | Sort-Object Number
+$out = @()
+foreach ($d in $disks) {
+  $parts = @()
+  foreach ($p in (Get-Partition -DiskNumber $d.Number)) {
+    $vol = $null
+    try { $vol = Get-Volume -Partition $p } catch {}
+    $parts += @{
+      name = if ($vol -and $vol.DriveLetter) { "$($vol.DriveLetter): $($vol.FileSystemLabel)" } elseif ($p.Type) { $p.Type } else { 'Partition' }
+      mount = if ($vol -and $vol.DriveLetter) { "$($vol.DriveLetter):\" } else { '' }
+      fsType = if ($vol) { $vol.FileSystem } else { '' }
+      total = [int64]$p.Size
+      used = if ($vol -and $vol.Size -gt 0) { [int64]($vol.Size - $vol.SizeRemaining) } else { 0 }
+      allocated = $true
+    }
+  }
+  $alloc = ($parts | Measure-Object total -Sum).Sum
+  if ($null -eq $alloc) { $alloc = 0 }
+  if ([int64]$d.Size -gt [int64]$alloc + 16MB) {
+    $parts += @{ name='Unallocated'; mount=''; fsType=''; total=[int64]($d.Size-$alloc); used=0; allocated=$false }
+  }
+  $usedTotal = ($parts | Where-Object { $_.allocated } | Measure-Object used -Sum).Sum
+  if ($null -eq $usedTotal) { $usedTotal = 0 }
+  $pct = if ($d.Size -gt 0) { [int](($usedTotal / $d.Size) * 100) } else { 0 }
+  $out += @{
+    name = "Disk $($d.Number)"
+    model = if ($d.FriendlyName) { $d.FriendlyName } else { 'Disk' }
+    total = [int64]$d.Size
+    percentage = $pct
+    partitions = $parts
+  }
+}
+$out | ConvertTo-Json -Depth 5
+"#;
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output().map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).to_string());
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    // PowerShell returns object directly for single, array for many. Normalize.
+    let trimmed = raw.trim();
+    let json_str = if trimmed.starts_with('{') { format!("[{}]", trimmed) } else { trimmed.to_string() };
+    let disks: Vec<PhysicalDisk> = serde_json::from_str(&json_str).map_err(|e| e.to_string())?;
+    Ok(disks)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn collect_disks_linux() -> Result<Vec<PhysicalDisk>, String> {
+    let out = prepare_command("lsblk")
+        .args(["-J", "-b", "-o", "NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,MODEL"])
+        .output().map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err("lsblk failed".to_string());
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
+    let blocks = v.get("blockdevices").and_then(|b| b.as_array()).cloned().unwrap_or_default();
+    let mut disks: Vec<PhysicalDisk> = Vec::new();
+    for b in blocks {
+        if b.get("type").and_then(|t| t.as_str()) != Some("disk") {
+            continue;
+        }
+        let name = b.get("name").and_then(|s| s.as_str()).unwrap_or("").to_string();
+        let model = b.get("model").and_then(|s| s.as_str()).unwrap_or("Disk").trim().to_string();
+        let total = b.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
+        let mut partitions: Vec<PartitionInfo> = Vec::new();
+        let mut alloc: u64 = 0;
+        if let Some(children) = b.get("children").and_then(|c| c.as_array()) {
+            for c in children {
+                let pname = c.get("name").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                let psize = c.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
+                let mount = c.get("mountpoint").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                let fs = c.get("fstype").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                alloc += psize;
+                let (ptotal, used) = if !mount.is_empty() {
+                    df_used(&mount).unwrap_or((psize, 0))
+                } else {
+                    (psize, 0)
+                };
+                partitions.push(PartitionInfo {
+                    name: if mount.is_empty() { pname } else { format!("{} ({})", mount, fs) },
+                    mount, fs_type: fs, total: ptotal, used, allocated: true,
+                });
+            }
+        }
+        if total > alloc && total - alloc > 16 * 1024 * 1024 {
+            partitions.push(PartitionInfo {
+                name: "Unallocated".to_string(), mount: String::new(), fs_type: String::new(),
+                total: total - alloc, used: 0, allocated: false,
+            });
+        }
+        let used_total: u64 = partitions.iter().filter(|p| p.allocated).map(|p| p.used).sum();
+        let percentage = if total > 0 { ((used_total as f64 / total as f64) * 100.0) as u32 } else { 0 };
+        disks.push(PhysicalDisk { name: format!("Disk {}", name), model, total, percentage, partitions });
+    }
+    Ok(disks)
+}
+
+#[tauri::command]
+fn get_disks_overview() -> Result<Vec<PhysicalDisk>, String> {
+    #[cfg(target_os = "macos")]
+    { return collect_disks_macos(); }
+    #[cfg(target_os = "windows")]
+    { return collect_disks_windows(); }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    { return collect_disks_linux(); }
+    #[allow(unreachable_code)]
+    Ok(Vec::new())
+}
+
 #[tauri::command]
 fn start_scan(
     scan_path: String,
@@ -1604,6 +1927,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_disk_space,
+            get_disks_overview,
             start_scan,
             cancel_scan,
             get_scan_results,
